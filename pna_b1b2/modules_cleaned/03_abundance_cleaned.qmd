@@ -1,0 +1,945 @@
+# 3. Abundance distribution
+
+**Module 03 — Abundance.** Plot marker abundance across samples and cell types. Run the first chunk below to load packages and the annotated object saved by module `02`. You can open this module in a new R session after module `02` has finished.
+
+```{r}
+#| label: module03_setup
+
+library(here)
+here::i_am("pna_b1b2/modules_cleaned/03_abundance_cleaned.qmd")
+
+source(here::here("pna_b1b2", "modules_cleaned", "00_setup_cleaned.R"))
+
+if (!exists("pg_data", inherits = TRUE)) {
+  pg_data <- load_checkpoint(input_object_name)
+}
+
+if (!exists("markers_to_test", inherits = TRUE)) {
+  markers_to_test <- load_markers_to_test_cleaned()
+}
+
+# Minimum number of cells a sample needs within a cell type to be included in
+# the abundance heatmaps (section 3.2), including the group-averaged ones
+heatmap_min_cells <- 15L
+```
+
+```{r}
+#| label: add_fmc63_to_markers_test
+
+# Add FMC63 to marker list if missing
+markers_to_test <- lapply(markers_to_test, function(cell_markers) {
+  cell_markers_new <- unique(c(cell_markers, "FMC63")) |> sort()
+  return(cell_markers_new)
+})
+
+# New markers_to_test based on abundance levels: keep markers with a mean CLR
+# > clr_cutoff in every sample with >= min_cells_per_sample cells of the cell
+# type (restricted to the original markers_to_test)
+source(here::here("pna_b1b2", "modules", "marker_selection_functions.R"))
+
+markers_to_test_clr <- select_markers_by_clr(
+  pg_data,
+  markers_to_test,
+  clr_cutoff = 0.5,
+  min_cells_per_sample = 10L,
+  always_keep = "FMC63"
+)
+
+markers_to_test <- markers_to_test_clr
+```
+
+## 3.1. Abundance violin plots
+
+> **Decision checkpoint** (abundance plots scope)  
+> In the opening chunk, set `markers_for_abundance_plots` and `abundance_plots_grouping_column` (`"condition"` vs `"sample_alias"`) for how faceted plots are grouped.
+
+This section generates abundance distribution plots for a selected subset of markers in the dataset, providing detailed visualizations of marker expression patterns across different experimental dimensions. For each marker, plots are generated using both normalized CLR (centered log-ratio) values and raw count data, allowing users to assess expression patterns in both normalized and absolute terms.
+
+The analysis creates multiple visualization perspectives to facilitate exploration:
+
+- **Per sample**: Shows marker abundance distributions across all samples, useful for identifying sample-specific expression patterns or batch effects
+- **Per cell type**: Displays marker expression within each annotated cell type, helping to identify cell type-specific markers and expression heterogeneity
+- **Per cell type faceted by group**: Combines cell type and group information (by default: condition), enabling identification of group-specific expression differences per cell type; switch `abundance_plots_grouping_column` to `"sample_alias"` to facet by individual sample instead
+- **Per condition faceted by cell type**: Compares marker abundance across experimental conditions within each cell type, useful for identifying condition-specific changes in marker expression
+
+These visualizations are valuable for quality control, marker validation, and exploratory data analysis. They help identify markers with high variability, detect potential batch effects, and understand marker expression patterns across the experimental design.
+
+**Note**: By default, only a selected subset of markers is plotted to keep runtime manageable. Adjust `markers_for_abundance_plots` to the markers relevant to your project.
+
+```{r}
+# Markers to generate abundance distribution plots for. Replace with the markers
+# relevant to your project, e.g.: c("CD3e", "CD4", "CD8").
+# By default the first 10 markers are used as a placeholder only.
+# To plot all markers set: markers_for_abundance_plots <- rownames(pg_data)
+# markers_for_abundance_plots <- rownames(pg_data)[seq_len(min(10, nrow(pg_data)))]
+markers_for_abundance_plots <- rownames(pg_data)
+
+# Column used to facet the "per cell type" plots. Set to "condition" (default) to
+# facet by experimental condition, or "sample_alias" to facet by individual sample.
+abundance_plots_grouping_column <- "sample_alias"
+
+all_markers <- rownames(pg_data)
+
+# Collect CLR and count data
+plot_data_clr <- FetchData(
+  pg_data,
+  c("sample_alias", "cell_annotation", "condition", all_markers),
+  layer = "data"
+)
+plot_data_cts <- FetchData(
+  pg_data,
+  c("sample_alias", "cell_annotation", "condition", all_markers),
+  layer = "counts"
+)
+
+# concatenate CLR and count data
+plot_data <- plot_data_clr |>
+  pivot_longer(
+    cols = all_of(all_markers),
+    names_to = "marker",
+    values_to = "abundance"
+  ) |>
+  mutate(metric = "CLR") |>
+  bind_rows(
+    plot_data_cts |>
+      pivot_longer(
+        cols = all_of(all_markers),
+        names_to = "marker",
+        values_to = "abundance"
+      ) |>
+      mutate(metric = "Count")
+  )
+
+plot_data |>
+  filter(marker %in% markers_for_abundance_plots) |>
+  group_by(marker) |>
+  group_map(
+    ~ {
+      marker_savename <- str_remove(.y, "\\.") # remove dot from marker name for saving files
+      # Create 2 plots for the current marker: CLR per sample, Count per sample
+      p_clr_per_sample <- .x |> # .x contains the grouped data for the current marker
+        filter(metric == "CLR") |>
+        ggplot(aes(sample_alias, abundance, color = sample_alias)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = sample_palette) +
+        labs(title = "CLR per sample", x = "", y = "CLR")
+
+      # Set y limits to the 99th percentile per marker
+      count_99 <- quantile(
+        .x$abundance[.x$metric == "Count"],
+        0.99,
+        na.rm = TRUE
+      )
+      p_count_per_sample <- .x |>
+        filter(metric == "Count") |>
+        ggplot(aes(sample_alias, abundance, color = sample_alias)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = sample_palette) +
+        labs(title = "Count per sample", x = "", y = "Count") +
+        ylim(NA, count_99)
+
+      # Save per sample plots
+      p_abundance_distribution_per_sample <- (p_clr_per_sample +
+        p_count_per_sample) +
+        patchwork::plot_annotation(title = paste0("Marker: ", .y)) # .y contains the name of the current marker
+      export_plot(
+        filename = glue::glue(here::here(
+          "pna_b1b2",
+          "results_cleaned/03_abundance/abundance_plots/per_sample/{marker_savename}_abundance_distribution_per_sample"
+        )),
+        width = 12,
+        height = 8,
+        plot = p_abundance_distribution_per_sample
+      )
+
+      # Create 2 plots for the current marker: CLR per cell type, Count per cell type
+      p_clr_per_celltype <- .x |>
+        filter(metric == "CLR") |>
+        ggplot(aes(cell_annotation, abundance, color = cell_annotation)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = cell_palette) +
+        labs(title = "CLR per cell type", x = "", y = "CLR")
+
+      p_count_per_celltype <- .x |>
+        filter(metric == "Count") |>
+        ggplot(aes(cell_annotation, abundance, color = cell_annotation)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = cell_palette) +
+        labs(title = "Count per cell type", x = "", y = "Count") +
+        ylim(NA, count_99)
+
+      # Save per cell type plots
+      p_abundance_distribution_per_celltype <- (p_clr_per_celltype +
+        p_count_per_celltype) +
+        patchwork::plot_annotation(title = paste0("Marker: ", .y)) # .y contains the name of the current marker
+      export_plot(
+        filename = glue::glue(here::here(
+          "pna_b1b2",
+          "results_cleaned/03_abundance/abundance_plots/per_cell_type/{marker_savename}_abundance_distribution_per_celltype"
+        )),
+        width = 12,
+        height = 8,
+        plot = p_abundance_distribution_per_celltype
+      )
+
+      # Save per cell type plots faceted by grouping column (default: condition;
+      # change abundance_plots_grouping_column to "sample_alias" to facet by sample)
+      p_clr_per_celltype_faceted_by_group <- .x |>
+        filter(metric == "CLR") |>
+        ggplot(aes(cell_annotation, abundance, color = cell_annotation)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = cell_palette) +
+        labs(
+          title = glue::glue(
+            "CLR per cell type faceted by {abundance_plots_grouping_column}"
+          ),
+          x = "",
+          y = "CLR"
+        ) +
+        facet_wrap(~ .data[[abundance_plots_grouping_column]])
+
+      p_count_per_celltype_faceted_by_group <- .x |>
+        filter(metric == "Count") |>
+        ggplot(aes(cell_annotation, abundance, color = cell_annotation)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = cell_palette) +
+        labs(
+          title = glue::glue(
+            "Count per cell type faceted by {abundance_plots_grouping_column}"
+          ),
+          x = "",
+          y = "Count"
+        ) +
+        facet_wrap(~ .data[[abundance_plots_grouping_column]]) +
+        ylim(NA, count_99)
+
+      p_abundance_distribution_per_celltype_faceted_by_group <- (p_clr_per_celltype_faceted_by_group +
+        p_count_per_celltype_faceted_by_group) +
+        patchwork::plot_annotation(title = paste0("Marker: ", .y)) # .y contains the name of the current marker
+      export_plot(
+        filename = glue::glue(here::here(
+          "pna_b1b2",
+          "results_cleaned/03_abundance/abundance_plots/per_cell_type_faceted_by_{abundance_plots_grouping_column}/{marker_savename}_abundance_distribution_per_celltype_faceted_by_{abundance_plots_grouping_column}"
+        )),
+        width = 16,
+        height = 12,
+        plot = p_abundance_distribution_per_celltype_faceted_by_group
+      )
+
+      # Create plots for the current marker: CLR per condition per cell type, Count per condition per cell type
+      p_clr_per_condition_faceted_by_celltype <- .x |>
+        filter(metric == "CLR") |>
+        ggplot(aes(condition, abundance, color = condition)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = condition_palette) +
+        labs(title = "CLR per condition per cell type", x = "", y = "CLR") +
+        facet_wrap(~cell_annotation)
+
+      p_count_per_condition_faceted_by_celltype <- .x |>
+        filter(metric == "Count") |>
+        ggplot(aes(condition, abundance, color = condition)) +
+        ggbeeswarm::geom_quasirandom() +
+        theme_bw() +
+        theme(legend.position = "none") +
+        scale_color_manual(values = condition_palette) +
+        labs(title = "Count per condition per cell type", x = "", y = "Count") +
+        facet_wrap(~cell_annotation) +
+        ylim(NA, count_99)
+
+      p_abundance_distribution_per_condition_faceted_by_celltype <- (p_clr_per_condition_faceted_by_celltype +
+        p_count_per_condition_faceted_by_celltype) +
+        patchwork::plot_annotation(title = paste0("Marker: ", .y)) # .y contains the name of the current marker
+      export_plot(
+        filename = glue::glue(here::here(
+          "pna_b1b2",
+          "results_cleaned/03_abundance/abundance_plots/per_condition_faceted_by_celltype/{marker_savename}_abundance_distribution_per_condition_faceted_by_celltype"
+        )),
+        width = 16,
+        height = 12,
+        plot = p_abundance_distribution_per_condition_faceted_by_celltype
+      )
+    }
+  )
+```
+
+## 3.2. Abundance heatmaps
+
+### 3.2.1 Top abundant markers per cell type
+
+Plot selected markers from `02_clutsering_annotation`
+
+```{r}
+#| label: abundance_heatmap_top_proteins_per_celltype
+#| 
+all_markers <- unlist(markers_to_test) |> unique()
+all_markers <- c(all_markers, "FMC63") |> unique()
+sample_order <- metadata |> arrange(timepoint) |> pull(sample_alias)
+
+# Fetch abundance data per cell type and donor
+plot_data_clr <- FetchData(
+  pg_data,
+  c("sample_alias", "cell_annotation", "condition", all_markers),
+  layer = "data"
+)
+
+# Summarize abundace data
+plot_data <- plot_data_clr |>
+  pivot_longer(
+    cols = all_of(all_markers),
+    names_to = "marker",
+    values_to = "abundance"
+  ) |>
+  mutate(metric = "CLR") |>
+  group_by(sample_alias, cell_annotation, marker) |>
+  summarise(
+    mean_clr = mean(abundance, na.rm = TRUE),
+    sd_clr = sd(abundance, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+# Only sample x cell type combinations with at least heatmap_min_cells cells
+# enter the heatmaps
+excluded_samples <- plot_data |>
+  distinct(cell_annotation, sample_alias, n_cells) |>
+  filter(n_cells < heatmap_min_cells) |>
+  arrange(cell_annotation, sample_alias)
+if (nrow(excluded_samples) > 0) {
+  message(
+    "Excluded from heatmaps (fewer than ",
+    heatmap_min_cells,
+    " cells):\n",
+    paste(
+      capture.output(print(as.data.frame(excluded_samples))),
+      collapse = "\n"
+    )
+  )
+}
+plot_data <- plot_data |> filter(n_cells >= heatmap_min_cells)
+
+cell_types <- plot_data$cell_annotation |> unique()
+# cell_select <- cells_plot[1]
+for (cell_select in cell_types) {
+  markers_to_plot <- markers_to_test[[cell_select]]
+  markers_to_plot <- c(markers_to_plot, "FMC63") |> unique()
+  # Prepare heatmap data
+  hm_data <-
+    plot_data |>
+    filter(cell_annotation == cell_select) |>
+    filter(marker %in% markers_to_plot) |>
+    group_by(sample_alias, marker) |>
+    select(marker, sample_alias, mean_clr) |>
+    # Pivot to wide format for heatmap
+    pivot_wider(
+      names_from = sample_alias,
+      values_from = mean_clr,
+      values_fill = 0
+    ) |>
+    column_to_rownames("marker") |>
+    t() |>
+    as.matrix()
+
+  # Plot heatmap
+  effect_vals <- as.numeric(hm_data)
+  effect_quantiles <- quantile(effect_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+  max_abs_effect <- max(abs(effect_quantiles))
+  breaks_range <- seq(0, max_abs_effect, length.out = 101)
+  # Loop-local: overwriting sample_order would drop samples missing from one
+  # cell type from every later cell type too
+  samples_plot <- intersect(sample_order, rownames(hm_data))
+
+  hm <-
+    hm_data[samples_plot, ] |>
+    pheatmap(
+      color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(
+        140
+      )[31:130],
+      # color = hcl.colors(120, "Zissou 1")[21:120],
+      # color = PixelgenGradient(100, "Cherry"),
+      breaks = breaks_range,
+      border_color = "white",
+      cellwidth = 10,
+      cellheight = 10,
+      cluster_rows = F,
+      cluster_cols = T,
+      # Sample annotations from common_setup.R. pheatmap draws annotation
+      # columns right to left, so reverse them to read timepoint, status,
+      # construct from left to right
+      annotation_row = sample_annotation[
+        samples_plot,
+        rev(sample_annotation_cols),
+        drop = FALSE
+      ],
+      annotation_colors = sample_annotation_colors,
+      # The names would overlap the 45-degree marker labels; the legends
+      # already name each annotation
+      annotation_names_row = FALSE,
+      heatmap_legend_param = list(title = "Mean CLR"),
+      fontsize = 7,
+      angle_col = "45",
+      main = paste0("Marker abundance in ", cell_select, " cells")
+    ) |>
+    as.ggplot()
+
+  export_plot(
+    filename = glue::glue(here::here(
+      "pna_b1b2",
+      "results_cleaned/03_abundance/marker_heatmap/{cell_select}_top_abundance_clr_per_donor"
+    )),
+    plot = hm,
+    width = 18,
+    height = 4
+  )
+
+  # Same markers averaged across samples per timepoint x construct. Each sample's
+  # mean CLR counts equally, regardless of how many cells it contributes.
+  group_summary <- hm_data[samples_plot, , drop = FALSE] |>
+    as.data.frame() |>
+    rownames_to_column("sample_alias") |>
+    pivot_longer(-sample_alias, names_to = "marker", values_to = "mean_clr") |>
+    left_join(
+      sample_annotation |>
+        rownames_to_column("sample_alias") |>
+        select(sample_alias, timepoint, construct),
+      by = "sample_alias"
+    ) |>
+    group_by(timepoint, construct, marker) |>
+    summarise(
+      mean_clr = mean(mean_clr),
+      n_samples = n(),
+      .groups = "drop"
+    ) |>
+    mutate(
+      timepoint = factor(
+        timepoint,
+        levels = names(sample_annotation_colors$timepoint)
+      ),
+      construct = factor(
+        construct,
+        levels = names(sample_annotation_colors$construct)
+      ),
+      group = paste(timepoint, construct, sep = "_")
+    ) |>
+    # Construct first, then timepoint, so each construct's t0 -> t1 rows are
+    # adjacent
+    arrange(construct, timepoint, marker)
+
+  group_output_basename <- glue::glue(here::here(
+    "pna_b1b2",
+    "results_cleaned/03_abundance/marker_heatmap/{cell_select}_top_abundance_clr_per_timepoint_construct"
+  ))
+  dir.create(
+    dirname(group_output_basename),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  write.csv(
+    group_summary,
+    paste0(group_output_basename, ".csv"),
+    row.names = FALSE
+  )
+
+  group_info <- group_summary |>
+    distinct(group, timepoint, construct, n_samples)
+  group_mat <- group_summary |>
+    select(group, marker, mean_clr) |>
+    pivot_wider(names_from = marker, values_from = mean_clr) |>
+    column_to_rownames("group") |>
+    as.matrix()
+  group_mat <- group_mat[group_info$group, colnames(hm_data), drop = FALSE]
+
+  group_annotation <- group_info |>
+    select(group, construct, timepoint) |>
+    mutate(across(c(construct, timepoint), as.character)) |>
+    column_to_rownames("group")
+
+  group_quantiles <- quantile(group_mat, probs = c(0.01, 0.99), na.rm = TRUE)
+  group_max <- max(abs(group_quantiles))
+  if (!is.finite(group_max) || group_max == 0) {
+    group_max <- 1
+  }
+  group_breaks <- seq(0, group_max, length.out = 101)
+
+  hm_group <-
+    group_mat |>
+    pheatmap(
+      color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(
+        140
+      )[31:130],
+      breaks = group_breaks,
+      border_color = "white",
+      cellwidth = 10,
+      cellheight = 10,
+      cluster_rows = F,
+      cluster_cols = ncol(group_mat) > 1,
+      labels_row = paste0(
+        group_info$group,
+        " (n = ",
+        group_info$n_samples,
+        ")"
+      ),
+      # Reversed order (see above): reads timepoint, construct left to right
+      annotation_row = group_annotation,
+      annotation_colors = sample_annotation_colors[c("timepoint", "construct")],
+      annotation_names_row = FALSE,
+      heatmap_legend_param = list(title = "Mean CLR\n(mean of samples)"),
+      fontsize = 7,
+      angle_col = "45",
+      main = paste0(
+        "Marker abundance in ",
+        cell_select,
+        " cells (mean per timepoint x construct)"
+      )
+    ) |>
+    as.ggplot()
+
+  export_plot(
+    filename = group_output_basename,
+    plot = hm_group,
+    width = 18,
+    height = 3
+  )
+}
+```
+
+
+
+
+### 3.2.2 Selected markers
+
+Look at abundance differences between donors for selected markers.
+
+```{r}
+markers_to_plot <- c(
+  # Names converted for PNA v2
+  "B2M",
+  "CD45",
+  "HLA-ABC",
+  "CD26",
+  "CD82",
+  "CD8",
+  "CD2",
+  "CD3e",
+  "HLA-DR",
+  "CD25",
+  "CD18",
+  "CD43",
+  "CD44",
+  "CD5",
+  "CD52",
+  "CD11a",
+  "CD29",
+  "CD7",
+  "CD55",
+  "CD71",
+  "CD48",
+  "CD45RB",
+  "CD150",
+  "CD49d",
+  "ICAM-3",
+  "CD47",
+  "CD86",
+  "CD84",
+  "CD58",
+  "CD37",
+  "ICAM-2",
+  "CD38",
+  "CD59",
+  "CD162",
+  "CD27",
+  "CD45RA",
+  "ICAM-1",
+  "ICOS",
+  "CD4",
+  "FMC63"
+)
+sample_order <- metadata |> arrange(timepoint) |> pull(sample_alias)
+
+# Fetch abundance data per cell type and donor
+plot_data_clr <- FetchData(
+  pg_data,
+  c("sample_alias", "cell_annotation", "condition", markers_to_plot),
+  layer = "data"
+)
+
+# Summarize abundace data
+plot_data <- plot_data_clr |>
+  pivot_longer(
+    cols = all_of(markers_to_plot),
+    names_to = "marker",
+    values_to = "abundance"
+  ) |>
+  mutate(metric = "CLR") |>
+  group_by(sample_alias, cell_annotation, marker) |>
+  summarise(
+    mean_clr = mean(abundance, na.rm = TRUE),
+    sd_clr = sd(abundance, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+# Only sample x cell type combinations with at least heatmap_min_cells cells
+# enter the heatmaps
+excluded_samples <- plot_data |>
+  distinct(cell_annotation, sample_alias, n_cells) |>
+  filter(n_cells < heatmap_min_cells) |>
+  arrange(cell_annotation, sample_alias)
+if (nrow(excluded_samples) > 0) {
+  message(
+    "Excluded from heatmaps (fewer than ",
+    heatmap_min_cells,
+    " cells):\n",
+    paste(
+      capture.output(print(as.data.frame(excluded_samples))),
+      collapse = "\n"
+    )
+  )
+}
+plot_data <- plot_data |> filter(n_cells >= heatmap_min_cells)
+
+cell_types <- plot_data$cell_annotation |> unique()
+# cell_select <- cells_plot[1]
+for (cell_select in cell_types) {
+  # Prepare heatmap data
+  hm_data <-
+    plot_data |>
+    filter(cell_annotation == cell_select) |>
+    group_by(sample_alias, marker) |>
+    select(marker, sample_alias, mean_clr) |>
+    # Pivot to wide format for heatmap
+    pivot_wider(
+      names_from = sample_alias,
+      values_from = mean_clr,
+      values_fill = 0
+    ) |>
+    column_to_rownames("marker") |>
+    t() |>
+    as.matrix()
+
+  # Plot heatmap
+  effect_vals <- as.numeric(hm_data)
+  effect_quantiles <- quantile(effect_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+  max_abs_effect <- max(abs(effect_quantiles))
+  breaks_range <- seq(0, max_abs_effect, length.out = 101)
+  # Loop-local: overwriting sample_order would drop samples missing from one
+  # cell type from every later cell type too
+  samples_plot <- intersect(sample_order, rownames(hm_data))
+
+  hm <-
+    hm_data[samples_plot, markers_to_plot] |>
+    pheatmap(
+      color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(
+        140
+      )[31:130],
+      # color = hcl.colors(120, "Zissou 1")[21:120],
+      # color = PixelgenGradient(100, "Cherry"),
+      breaks = breaks_range,
+      border_color = "white",
+      cellwidth = 10,
+      cellheight = 10,
+      cluster_rows = F,
+      cluster_cols = F,
+      heatmap_legend_param = list(title = "Mean CLR"),
+      fontsize = 7,
+      angle_col = "45",
+      main = paste0("Marker abundance in ", cell_select, " cells")
+    ) |>
+    as.ggplot()
+
+  export_plot(
+    filename = glue::glue(here::here(
+      "pna_b1b2",
+      "results_cleaned/03_abundance/selected_marker_heatmap/{cell_select}_abundance_clr_per_donor"
+    )),
+    plot = hm,
+    width = 8,
+    height = 4
+  )
+}
+```
+
+
+```{r}
+markers_to_plot <- c(
+  # Names converted for PNA v2
+  "CD52",
+  "CD59",
+  "B2M",
+  "HLA-ABC",
+  "CD43",
+  "CD49d",
+  "CD2",
+  "CD8"
+)
+sample_order <- metadata |> arrange(timepoint) |> pull(sample_alias)
+
+# Fetch abundance data per cell type and donor
+plot_data_clr <- FetchData(
+  pg_data,
+  c("sample_alias", "cell_annotation", "condition", markers_to_plot),
+  layer = "data"
+)
+
+# Summarize abundace data
+plot_data <- plot_data_clr |>
+  pivot_longer(
+    cols = all_of(markers_to_plot),
+    names_to = "marker",
+    values_to = "abundance"
+  ) |>
+  mutate(metric = "CLR") |>
+  group_by(sample_alias, cell_annotation, marker) |>
+  summarise(
+    mean_clr = mean(abundance, na.rm = TRUE),
+    sd_clr = sd(abundance, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+# Only sample x cell type combinations with at least heatmap_min_cells cells
+# enter the heatmaps
+excluded_samples <- plot_data |>
+  distinct(cell_annotation, sample_alias, n_cells) |>
+  filter(n_cells < heatmap_min_cells) |>
+  arrange(cell_annotation, sample_alias)
+if (nrow(excluded_samples) > 0) {
+  message(
+    "Excluded from heatmaps (fewer than ",
+    heatmap_min_cells,
+    " cells):\n",
+    paste(
+      capture.output(print(as.data.frame(excluded_samples))),
+      collapse = "\n"
+    )
+  )
+}
+plot_data <- plot_data |> filter(n_cells >= heatmap_min_cells)
+
+cell_types <- plot_data$cell_annotation |> unique()
+# cell_select <- cells_plot[1]
+for (cell_select in cell_types) {
+  # Prepare heatmap data
+  hm_data <-
+    plot_data |>
+    filter(cell_annotation == cell_select) |>
+    group_by(sample_alias, marker) |>
+    select(marker, sample_alias, mean_clr) |>
+    # Pivot to wide format for heatmap
+    pivot_wider(
+      names_from = sample_alias,
+      values_from = mean_clr,
+      values_fill = 0
+    ) |>
+    column_to_rownames("marker") |>
+    t() |>
+    as.matrix()
+
+  # Plot heatmap
+  effect_vals <- as.numeric(hm_data)
+  effect_quantiles <- quantile(effect_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+  max_abs_effect <- max(abs(effect_quantiles))
+  breaks_range <- seq(0, max_abs_effect, length.out = 101)
+  # Loop-local: overwriting sample_order would drop samples missing from one
+  # cell type from every later cell type too
+  samples_plot <- intersect(sample_order, rownames(hm_data))
+
+  hm <-
+    hm_data[samples_plot, markers_to_plot] |>
+    pheatmap(
+      color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(
+        140
+      )[31:130],
+      # color = hcl.colors(120, "Zissou 1")[21:120],
+      # color = PixelgenGradient(100, "Cherry"),
+      breaks = breaks_range,
+      border_color = "white",
+      cellwidth = 10,
+      cellheight = 10,
+      cluster_rows = F,
+      cluster_cols = F,
+      heatmap_legend_param = list(title = "Mean CLR"),
+      fontsize = 7,
+      angle_col = "45",
+      main = paste0("Marker abundance in ", cell_select, " cells")
+    ) |>
+    as.ggplot()
+
+  export_plot(
+    filename = glue::glue(here::here(
+      "pna_b1b2",
+      "results_cleaned/03_abundance/selected_marker_heatmap/{cell_select}_abundance_clr_per_donor_v2"
+    )),
+    plot = hm,
+    width = 8,
+    height = 4
+  )
+}
+```
+
+
+```{r}
+markers_to_plot <- c(
+  "B2M",
+  "CD45",
+  "CD8",
+  "HLA-ABC",
+  "CD26",
+  "CD82",
+  "CD3e",
+  "CD2",
+  "CD44",
+  "CD43",
+  "CD18",
+  "CD52",
+  "HLA-DR",
+  "CD11a",
+  "CD5",
+  "CD29",
+  "CD49d",
+  "CD59",
+  "CD162",
+  "CD38",
+  "CD27",
+  "FMC63",
+  "CD7",
+  "CD55",
+  "CD48",
+  "CD47",
+  "CD150",
+  "ICAM-3",
+  "CD25",
+  "CD71",
+  "CD86",
+  "CD45RB",
+  "CD84",
+  "CD58",
+  "ICAM-2",
+  "CD37",
+  "CD45RA",
+  "2B4",
+  "ICAM-1",
+  "CD11c",
+  "ICOS",
+  "CD39"
+)
+sample_order <- metadata |> arrange(timepoint) |> pull(sample_alias)
+
+# Fetch abundance data per cell type and donor
+plot_data_clr <- FetchData(
+  pg_data,
+  c("sample_alias", "cell_annotation", "condition", markers_to_plot),
+  layer = "data"
+)
+
+# Summarize abundace data
+plot_data <- plot_data_clr |>
+  pivot_longer(
+    cols = all_of(markers_to_plot),
+    names_to = "marker",
+    values_to = "abundance"
+  ) |>
+  mutate(metric = "CLR") |>
+  group_by(sample_alias, cell_annotation, marker) |>
+  summarise(
+    mean_clr = mean(abundance, na.rm = TRUE),
+    sd_clr = sd(abundance, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+# Only sample x cell type combinations with at least heatmap_min_cells cells
+# enter the heatmaps
+excluded_samples <- plot_data |>
+  distinct(cell_annotation, sample_alias, n_cells) |>
+  filter(n_cells < heatmap_min_cells) |>
+  arrange(cell_annotation, sample_alias)
+if (nrow(excluded_samples) > 0) {
+  message(
+    "Excluded from heatmaps (fewer than ",
+    heatmap_min_cells,
+    " cells):\n",
+    paste(
+      capture.output(print(as.data.frame(excluded_samples))),
+      collapse = "\n"
+    )
+  )
+}
+plot_data <- plot_data |> filter(n_cells >= heatmap_min_cells)
+
+cell_types <- plot_data$cell_annotation |> unique()
+# cell_select <- cells_plot[1]
+for (cell_select in cell_types) {
+  # Prepare heatmap data
+  hm_data <-
+    plot_data |>
+    filter(cell_annotation == cell_select) |>
+    group_by(sample_alias, marker) |>
+    select(marker, sample_alias, mean_clr) |>
+    # Pivot to wide format for heatmap
+    pivot_wider(
+      names_from = sample_alias,
+      values_from = mean_clr,
+      values_fill = 0
+    ) |>
+    column_to_rownames("marker") |>
+    t() |>
+    as.matrix()
+
+  # Plot heatmap
+  effect_vals <- as.numeric(hm_data)
+  effect_quantiles <- quantile(effect_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+  max_abs_effect <- max(abs(effect_quantiles))
+  breaks_range <- seq(0, max_abs_effect, length.out = 101)
+  # Loop-local: overwriting sample_order would drop samples missing from one
+  # cell type from every later cell type too
+  samples_plot <- intersect(sample_order, rownames(hm_data))
+
+  hm <-
+    hm_data[samples_plot, markers_to_plot] |>
+    pheatmap(
+      color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(
+        140
+      )[31:130],
+      # color = hcl.colors(120, "Zissou 1")[21:120],
+      # color = PixelgenGradient(100, "Cherry"),
+      breaks = breaks_range,
+      border_color = "white",
+      cellwidth = 10,
+      cellheight = 10,
+      cluster_rows = F,
+      cluster_cols = F,
+      heatmap_legend_param = list(title = "Mean CLR"),
+      fontsize = 7,
+      angle_col = "45",
+      main = paste0("Marker abundance in ", cell_select, " cells")
+    ) |>
+    as.ggplot()
+
+  export_plot(
+    filename = glue::glue(here::here(
+      "pna_b1b2",
+      "results_cleaned/03_abundance/selected_marker_heatmap/{cell_select}_abundance_clr_per_donor_v3"
+    )),
+    plot = hm,
+    width = 8,
+    height = 4
+  )
+}
+```
+
+
+

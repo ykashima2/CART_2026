@@ -1,0 +1,56 @@
+---
+title: "Proxiome Analysis: Platelet-Cleaned Data"
+subtitle: "Modules 03, 04, 05 and 05b on the T-cell object from module 02b"
+format:
+  html:
+    toc: true
+    toc-location: left
+    theme: cosmo
+    code-copy: true
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+execute:
+  execute-dir: project
+  echo: true
+  warning: false
+  message: false
+---
+
+This report repeats the abundance, proximity and statistical testing modules on the platelet-cleaned T-cell object (`pg_data_platelet_cleaned.rds`) written by module `02b`. The original analysis (`proxiome_analysis_template.qmd`, `modules/`) is unchanged.
+
+**How the platelet clean-up works** (module `02b`, `modules/02b_platelet_cleanup.qmd`):
+
+- The cell graph of every T cell is segmented into `tcell`, `platelet`, `interface` and `other` nodes using protein weights that contrast T cells with platelets (`segment_cell()`; interface detection on, minimum component size 50).
+- Cells in which platelet nodes make up 20 % or more of the molecules (`max_contam_fraction = 0.2`, `fraction_basis = "umi"`) are removed.
+- In the remaining cells, platelet, interface and unclassified nodes are dropped, and protein counts and proximity scores (analytical mode) are recomputed from the reduced graphs; counts are CLR-normalised again.
+- Cells are processed in resumable batches from one sample at a time, with the batch size set from a memory budget (8 GB per batch). The run is started with `run_cleanup <- TRUE`.
+- QC outputs (platelet fraction per sample, proximity scores before and after clean-up) are written to `results/02b_platelet_cleanup/`.
+
+**Where things live:**
+
+- Module scripts: `modules_cleaned/` (copies of modules `03`, `04`, `05` and `05b` with `_cleaned` suffix, plus `00_setup_cleaned.R`).
+- Input: `results/checkpoint_data/pg_data_platelet_cleaned.rds` (and `markers_to_test.rds`, restricted to the four T-cell types).
+- Output: `results_cleaned/{03_abundance, 04_proximity, 05_statistical_testing, 05b_statistical_testing_response}/`.
+- Clean-up module and QC: `modules/02b_platelet_cleanup.qmd`, `modules/platelet_cleanup_functions.R`, `results/02b_platelet_cleanup/`.
+
+**Differences from the original modules:**
+
+- Only the four T-cell types in the cleaned object are analysed (CD4/CD8 T, FMC63+/-).
+- `ProximityScores(..., lazy = FALSE)`: the cleaned object holds its proximity scores in memory, not in a PXL database.
+- The platelet-marker refinement section of module `04` is removed.
+
+{{< include modules_cleaned/03_abundance_cleaned.qmd >}}
+
+{{< include modules_cleaned/04_proximity_cleaned.qmd >}}
+
+{{< include modules_cleaned/05_statistical_testing_cleaned.qmd >}}
+
+{{< include modules_cleaned/05b_statistical_testing_response_cleaned.qmd >}}
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
