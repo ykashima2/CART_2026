@@ -1,0 +1,9 @@
+sample	donor	type	dpi	timepoint	file_path
+TKB_CAR-T_10	donorD	PBMC	d07	t1	TKB_CART_10.layout.dataset.pxl
+TKB_CAR-T_2	donorE	PBMC	d07	t1	TKB_CART_2.layout.dataset.pxl
+TKB_CAR-T_50	donorF	CAR-T_product	d00	t0	TKB_CART_50.layout.dataset.pxl
+TKB_CAR-T_55	donorF	PBMC	d11	t1	TKB_CART_55.layout.dataset.pxl
+TKB_CAR-T_194	donorG	CAR-T_product	d00	t0	TKB_CART_194.layout.dataset.pxl
+TKB_CAR-T_198	donorG	PBMC	d07	t1	TKB_CART_198.layout.dataset.pxl
+TKB_CAR-T_175	donorH	CAR-T_product	d00	t0	TKB_CART_175.layout.dataset.pxl
+TKB_CAR-T_181	donorH	PBMC	d10	t1	TKB_CART_181.layout.dataset.pxl

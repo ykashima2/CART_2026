@@ -1,0 +1,7217 @@
+---
+title: "Suzuki -- CAR-T clinical study -- Analysis: t0t1 with both batch 1 and 2 MPX data"
+subtitle: "Pixelgen MPX data analysis"
+author: "Lovisa Franzén"
+date: "2026-09-15"
+output: html_document
+format:
+  html:
+    theme: default
+    page-layout: full
+    code_folding: show
+    embed-resources: true
+    toc: true
+    toc-location: right
+    toc-depth: 5
+---
+
+# Setup
+
+Loads packages, helper functions and colour palettes, and reads the processed MPX objects from both batches.
+
+## Libraries, parameters, and functions
+
+Sources all helper scripts in scripts/R/, loads the required packages and defines the colour palettes used across the figures.
+
+```{r general_def, message=FALSE}
+#| code-fold: true
+set.seed(1)
+here::i_am("mpx_2/scripts/02_analysis_b1b2.qmd")
+
+png_res <- 300
+
+# General rule for the minimum number of cells of a cell type in a sample: 15 where
+# no sensitive test is run (marker selection, averages shown in heatmaps and
+# networks, cell-level tests). The unpaired pseudobulk limma tests of Fig 5 and 6
+# use a higher value (pseudobulk_min_cells = 30, set in chunk fig-5-daa-pseudobulk).
+# Plots made per donor or per sample show all samples and need no cutoff.
+min_cells_default <- 15
+```
+
+```{r message=FALSE}
+#| code-fold: true
+#| output: false
+
+fn_sources <- list.files(
+  here::here("mpx_2/scripts", "R"),
+  pattern = "*.R$",
+  full.names = TRUE
+)
+
+sapply(fn_sources, source, .GlobalEnv)
+```
+
+```{r message=FALSE}
+#| code-fold: true
+load_packages(
+  c(
+    "dplyr",
+    "tidyr",
+    "ggplot2",
+    "patchwork",
+    "pixelatorR",
+    "Seurat",
+    "readr",
+    "ggrepel",
+    "harmony",
+    "here",
+    "stringr",
+    "tibble",
+    "ComplexHeatmap",
+    "glue",
+    "conflicted",
+    "gt"
+  )
+)
+
+library(ggbeeswarm)
+library(quartabs)
+
+library(tidygraph)
+library(ggraph)
+
+# install.packages("ggalluvial")
+library(ggalluvial)
+
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+```
+
+
+\
+
+## Read data
+
+We will continue to work from the data object that we created in the first processing script. This includes all the necessary information we need to continue the analysis here.
+
+Here we read the processed batch 2 object and the batch 1 object from the mpx project. 
+Platelets (and discarded cells in batch 1) are removed. 
+Batch 1 donor IDs and cell type names are harmonised to the batch 2 naming.
+
+```{r}
+data_t0t1_b1 <- readRDS(here(
+  "mpx",
+  "rdata",
+  "robj_suzuki_cart_processed_data_all.rds"
+)) |>
+  subset(timepoint %in% c("t0", "t1"))
+
+data_donorA <- readRDS(here(
+  "mpx",
+  "rdata",
+  "robj_suzuki_cart_processed_data_all.rds"
+)) |>
+  subset(donor %in% c("donor_32"))
+
+data_t0t1_b2 <- readRDS(here(
+  "mpx_2",
+  "rdata",
+  "robj_suzuki_cart_processed_data_mpx_b2_all.rds"
+))
+
+data_t0_b1b2 <- readRDS(here(
+  "mpx_2",
+  "rdata",
+  "robj_suzuki_cart_processed_data_b1b2_t0.rds"
+))
+```
+
+Update filtering of data to exclude platelets and cells annotated as "discard" (batch 1) or "other" (batch 2).
+
+```{r}
+# Prepare b1 data for merge
+data_t0t1_b1 <- data_t0t1_b1 |>
+  subset(celltype != "Platelets") |>
+  subset(celltype != "discard") |>
+  subset(celltype != "other")
+
+data_t0t1_b1$batch <- "batch_1"
+
+data_t0t1_b1@meta.data <- data_t0t1_b1@meta.data |>
+  mutate(
+    donor = case_when(
+      donor == 'donor_32' ~ 'donorA',
+      donor == 'donor_44' ~ 'donorB',
+      donor == 'donor_50' ~ 'donorC',
+      TRUE ~ donor
+    )
+  )
+
+# Update celltype annotation for FMC63- cells in b1
+data_t0t1_b1@meta.data <- data_t0t1_b1@meta.data |>
+  mutate(
+    celltype = case_when(
+      celltype == 'CD4 T' ~ 'CD4 T FMC63-',
+      celltype == 'CD8 T' ~ 'CD8 T FMC63-',
+      TRUE ~ celltype
+    )
+  )
+
+# Prepare b2 data for merge
+data_t0t1_b2 <- data_t0t1_b2 |>
+  subset(celltype != "Platelets") |>
+  subset(celltype != "other") # TEST: see if it makes a difference to remove the "other" cells
+
+data_t0t1_b2$batch <- "batch_2"
+
+# Make formatting edits to align datasets
+```
+
+```{r}
+# Make same formatting for T0 data
+data_t0_b1b2 <- data_t0_b1b2 |>
+  subset(celltype != "other")
+```
+
+## Merge data
+
+Combines both batches into a single Seurat object, data_t0t1_b1b2, with joined layers.
+
+```{r}
+data_t0t1_b1b2 <- merge(
+  data_t0t1_b1,
+  y = data_t0t1_b2,
+) |>
+  SeuratObject::JoinLayers()
+
+# Update metadata and make formatting edits to align datasets
+data_t0t1_b1b2$sample_alias <- paste0(
+  data_t0t1_b1b2$donor,
+  "_",
+  data_t0t1_b1b2$timepoint
+)
+
+data_t0t1_b1b2$celltype[data_t0t1_b1b2$celltype == "Other T"] <- "T other"
+```
+
+# Reprocessing merged data
+
+Re-runs normalisation, dimensionality reduction and integration on the merged object, since the per-batch embeddings aren't comparable.
+
+## Normalize and scale
+
+CLR-normalises the merged counts and scales the data for PCA.
+
+```{r}
+data_t0t1_b1b2 <- data_t0t1_b1b2 |>
+  NormalizeMPX(method = "clr") |>
+  ScaleData()
+```
+
+
+## PCA & UMAP
+
+Runs PCA, chooses the number of PCs from the elbow plot (15) and computes an uncorrected UMAP, shown by batch, donor, timepoint and cell type.
+
+```{r fig.width=6, fig.height=4}
+data_t0t1_b1b2 <- data_t0t1_b1b2 |>
+  RunPCA()
+
+ElbowPlot(data_t0t1_b1b2, ndims = 30)
+```
+
+```{r}
+n_dims <- 15
+data_t0t1_b1b2 <- data_t0t1_b1b2 |>
+  RunUMAP(reduction = "pca", dims = 1:n_dims, reduction.name = "umap.pca")
+```
+
+```{r fig.width=15, fig.height=5}
+pt_size <- 0.1
+p1 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.pca",
+  group.by = "batch",
+  # cols = pal_samples,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p2 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.pca",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p3 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.pca",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p4 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.pca",
+  group.by = "celltype",
+  cols = cell_type_palette_fmc,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p <- (p1 | p2 | p3 | p4)
+p
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "processed",
+    "pca_umap_dimplot"
+  ),
+  plot = p,
+  width = 20,
+  height = 5
+)
+```
+
+
+### Harmony
+
+Integrates the PCs with Harmony (by sample and batch) and computes a corrected UMAP, followed by FMC63 / T cell marker UMAPs and density-scatter QC plots.
+
+```{r}
+integrate_by <- c("sample", "batch") # TEST: exclude 'type'
+
+data_t0t1_b1b2 <- data_t0t1_b1b2 |>
+  RunHarmony(
+    group.by.vars = integrate_by,
+    plot_convergence = FALSE
+  ) |>
+  RunUMAP(
+    reduction = "harmony",
+    dims = 1:n_dims,
+    reduction.name = "umap.harmony"
+  )
+```
+
+
+```{r fig.width=15, fig.height=5}
+pt_size <- 0.1
+p1 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "batch",
+  # cols = pal_samples,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p2 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p3 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p4 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_type_palette_fmc,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p <- (p1 | p2 | p3 | p4)
+p
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "processed",
+    "pca_harmony_umap_dimplot"
+  ),
+  plot = p,
+  width = 20,
+  height = 5
+)
+```
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p2 <- FeaturePlot(
+  object = data_t0t1_b1b2,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.harmony",
+  cols = cherry_gradient(2), #gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  max.cutoff = 4,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "processed",
+    "all_pca_harmony_umap_featureplot"
+  ),
+  plot = p,
+  width = 20,
+  height = 5
+)
+```
+
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_t0t1_b1b2$celltype |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_t0t1_b1b2, celltype %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "celltype"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_t0t1_b1b2, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "celltype"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "processed",
+    "all_tcell_markers_density_plot"
+  ),
+  plot = p,
+  width = 10,
+  height = 7
+)
+```
+
+```{r}
+p1 <- DensityScatterPlot(
+  subset(data_t0t1_b1b2, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = c("celltype_broad", "timepoint")
+) &
+  geom_hline(yintercept = 1.5, linetype = "dashed", colour = "grey")
+
+p2 <- DensityScatterPlot(
+  subset(data_t0t1_b1b2, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD3E",
+  marker2 = "FMC63",
+  facet_vars = c("celltype_broad", "timepoint")
+) &
+  geom_hline(yintercept = 1.5, linetype = "dashed", colour = "grey")
+
+p <- p1 | p2
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "processed",
+    "all_tcell_broad_fmc63_density_plot"
+  ),
+  plot = p,
+  width = 7,
+  height = 5
+)
+```
+
+```{r}
+p1 <- DensityScatterPlot(
+  subset(data_t0t1_b1b2, celltype %in% celltypes_plot & timepoint == "t0"),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD3E",
+  marker2 = "FMC63",
+  facet_vars = c("celltype_broad", "batch")
+) &
+  geom_hline(yintercept = c(0, 1.5), linetype = "dashed", colour = "red") &
+  labs(title = "T0")
+
+p2 <- DensityScatterPlot(
+  subset(data_t0t1_b1b2, celltype %in% celltypes_plot & timepoint == "t1"),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD3E",
+  marker2 = "FMC63",
+  facet_vars = c("celltype_broad", "batch")
+) &
+  geom_hline(yintercept = c(0), linetype = "dashed", colour = "red") &
+  labs(title = "T1")
+
+p <- p1 | p2
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "processed",
+    "all_tcell_broad_fmc63_density_plot_splittime"
+  ),
+  plot = p,
+  width = 7,
+  height = 5
+)
+```
+
+
+## Export merged object
+
+```{r}
+saveRDS(
+  data_t0t1_b1b2,
+  file = here(
+    "mpx_2",
+    "rdata",
+    "robj_suzuki_cart_processed_data_mpx_t0t1_b1b2_merged.rds"
+  )
+)
+```
+
+---
+
+# Updated manuscript figures
+
+* Figure 3: "Characterization of clinical samples by protein abundance and single-cell transcriptome". 
+CAR T product alone (only T0 data). 
+* Figure 4: "Characterization of CAR-T products by polarity and colocalization"
+* Figure 5: "In vivo-induced changes in cellular composition and protein abundance"
+* Figure 6: "In vivo-induced remodeling of CAR-centered protein organization in CD8+ FMC63+ cells"
+
+```{r}
+# data_t0t1_b1b2 <- readRDS(here(
+#   "mpx_2",
+#   "rdata",
+#   "robj_suzuki_cart_processed_data_mpx_t0t1_b1b2_merged.rds"
+# ))
+```
+
+# Figure 3
+
+## 3B: UMAPs
+
+### TO data (only CAR T product) (NEW)
+
+```{r fig.width=16, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_t0_b1b2,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_type_palette_fmc,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters with FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_t0_b1b2,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_t0_b1b2,
+  reduction = "umap.harmony",
+  group.by = "donor",
+  pt.size = pt_size,
+  cols = pal_donor
+) +
+  labs(title = "Donor") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- FeaturePlot(
+  object = data_t0_b1b2,
+  reduction = "umap.harmony",
+  features = "FMC63",
+  slot = "data",
+  cols = c("#E5E5E5", "#053061"),
+  min.cutoff = -1,
+  # "#E5E5E5" "#F3E2E7" "#FCDAE5" "#F0BCCD" "#E29CB3" "#D37C98" "#BE5F7D" "#A64463" "#8F2C4B" "#781534"
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 abundance (CLR)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- wrap_plots(p1, p2, p3, p4, ncol = 2)
+p
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "3B_umaps_t0_alone" # Manuscript: Main Figure 3B
+  ),
+  plot = p,
+  width = 7 * 1.5,
+  height = 6 * 1.5
+)
+```
+
+
+### All data
+
+```{r fig.width=16, fig.height=5}
+pt_size <- 0.1
+
+p1 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_type_palette_fmc,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters with FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "donor",
+  pt.size = pt_size,
+  cols = pal_donor
+) +
+  labs(title = "Donor") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- FeaturePlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  features = "FMC63",
+  slot = "data",
+  cols = c("#E5E5E5", "#053061"),
+  min.cutoff = -1,
+  # "#E5E5E5" "#F3E2E7" "#FCDAE5" "#F0BCCD" "#E29CB3" "#D37C98" "#BE5F7D" "#A64463" "#8F2C4B" "#781534"
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 abundance (CLR)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- wrap_plots(p1, p2, p3, p4, ncol = 2)
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "3B_umaps_all"
+  ),
+  plot = p,
+  width = 7 * 1.5,
+  height = 6 * 1.5
+)
+```
+
+
+## 3C: Density plots
+
+```{r}
+ds_cd4 <- DensityScatterPlot(
+  data_t0_b1b2 |> subset(type == "CAR-T_product" & celltype_broad == "CD4 T"),
+  marker1 = "CD4",
+  marker2 = "FMC63",
+  plot_gate = tibble(xmin = 0.1, xmax = 5, ymin = 1.5, ymax = 5.5),
+  gate_type = "rectangle",
+  facet_vars = "celltype_broad",
+  annotation_params = list(size = 4)
+) +
+  facet_grid(cols = vars(celltype_broad)) +
+  lims(x = c(0, 5), y = c(-5, 6)) +
+  theme(
+    aspect.ratio = 1,
+    strip.text = element_text(size = 14, face = "bold", color = "white"),
+    strip.background = element_rect(fill = "#224792", color = "#224792")
+  )
+
+
+ds_cd8 <- DensityScatterPlot(
+  data_t0_b1b2 |> subset(type == "CAR-T_product" & celltype_broad == "CD8 T"),
+  marker1 = "CD8",
+  marker2 = "FMC63",
+  plot_gate = tibble(xmin = 1, xmax = 5, ymin = 1.5, ymax = 5.5),
+  gate_type = "rectangle",
+  facet_vars = "celltype_broad",
+  annotation_params = list(size = 4),
+) +
+  facet_grid(cols = vars(celltype_broad)) +
+  lims(x = c(0, 5), y = c(-5, 6)) +
+  theme(
+    aspect.ratio = 1,
+    strip.text = element_text(size = 14, face = "bold", color = "white"),
+    strip.background = element_rect(fill = "#A75FC3", color = "#A75FC3")
+  )
+
+
+export_plot(
+  filename = here("mpx_2", "results", "b1b2_t0t1", "revised_figs", "3C"), # Manuscript: Main Figure 3C
+  plot = wrap_plots(ds_cd4, ds_cd8, ncol = 2),
+  width = 5 * 1.5,
+  height = 3 * 1.5
+)
+```
+
+## 3D: Cell fractions
+
+### CAR T product (T0) only
+
+Only for selected cell types.
+```{r}
+data_t0_b1b2[[]] |>
+  select(donor, celltype, timepoint) |>
+  filter(
+    celltype %in%
+      c(
+        "CD4 T FMC63-",
+        "CD4 T FMC63+",
+        "CD8 T FMC63-",
+        "CD8 T FMC63+",
+        "NK",
+        "T other"
+      )
+  ) |>
+  summarize(
+    n = n(),
+    .by = c(donor, celltype, timepoint)
+  ) |>
+  arrange(donor, celltype) |>
+  readr::write_csv(here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "cell_counts_t0.csv"
+  ))
+
+cell_fraction_plot <- pixelatorR::CellCountPlot(
+  data_t0_b1b2 |>
+    subset(timepoint == "t0"),
+  group_by = "donor",
+  color_by = "celltype",
+  stack = TRUE,
+  as_frequency = TRUE
+)
+
+cell_fraction_data <- cell_fraction_plot$data |>
+  mutate(
+    frequency = frequency / 100,
+  )
+
+final_plot <- ggplot(
+  cell_fraction_data |>
+    mutate(donor = gsub("donor", "", donor)),
+  aes(x = donor, y = frequency, fill = celltype)
+) +
+  geom_bar(stat = "identity", width = 0.8, color = "black", linewidth = 0.3) +
+  scale_fill_manual(values = cell_type_palette_fmc) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid.major.x = element_blank(),
+    aspect.ratio = 1
+  ) +
+  labs(x = "Donor", y = "Frequency", fill = NULL)
+
+final_plot
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "3D_cell_props" # Manuscript: Main Figure 3D (left)
+  ),
+  plot = final_plot,
+  width = 5,
+  height = 4
+)
+```
+
+Alternative plot:
+
+```{r}
+# Swarm plot of the same t0 cell fractions: one point per donor, CD4/CD8 T only
+# Share of FMC63+ (CAR+) cells among all CD4 T and all CD8 T cells, per donor (t0)
+tcell_types <- c("CD4 T FMC63-", "CD4 T FMC63+", "CD8 T FMC63-", "CD8 T FMC63+")
+
+fmc63_fraction_data <- cell_fraction_data |>
+  filter(celltype %in% tcell_types) |>
+  # A donor with no cells of a subtype has no row; add it as a 0 count
+  tidyr::complete(donor, celltype = tcell_types, fill = list(n = 0)) |>
+  mutate(
+    lineage = sub(" FMC63[+-]$", "", celltype),
+    fmc63_status = sub("^.* ", "", celltype)
+  ) |>
+  summarise(
+    n_fmc63_pos = sum(n[fmc63_status == "FMC63+"]),
+    n_total = sum(n),
+    .by = c(donor, lineage)
+  ) |>
+  # A donor with no CD4 (or CD8) T cells at all has no defined fraction
+  filter(n_total > 0) |>
+  mutate(
+    fmc63_frequency = n_fmc63_pos / n_total,
+    lineage = factor(lineage, levels = c("CD4 T", "CD8 T"))
+  )
+
+fmc63_swarm_plot <- ggplot(
+  fmc63_fraction_data,
+  aes(x = lineage, y = fmc63_frequency)
+) +
+  # Median per lineage
+  # stat_summary(
+  #   fun = median,
+  #   geom = "crossbar",
+  #   width = 0.5,
+  #   linewidth = 0.3,
+  #   color = "grey40"
+  # ) +
+  geom_boxplot() +
+  ggbeeswarm::geom_beeswarm(
+    aes(fill = donor),
+    shape = 21,
+    size = 3,
+    cex = 3,
+    color = "black",
+    stroke = 0.25,
+    dodge.width = 0.25
+  ) +
+  scale_fill_manual(values = pal_donor, labels = \(x) gsub("donor", "", x)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  geom_hline(yintercept = c(0, 1), linewidth = 0.25) +
+  theme_linedraw(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    aspect.ratio = 1.5,
+    axis.text = element_text(size = 10)
+  ) +
+  labs(
+    x = NULL,
+    y = "FMC63+ cells (% of lineage)",
+    title = "Cell proportions at T0",
+    fill = "Donor"
+  )
+fmc63_swarm_plot
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "3D_fmc63_fraction_swarm" # Manuscript: Main Figure 3D (right)
+  ),
+  plot = fmc63_swarm_plot,
+  width = 3,
+  height = 4
+)
+```
+
+
+
+## 3E & 3F: scRNA-seq
+
+(skip)
+
+## 3G: T0 Abundance differences in CAR T product
+
+### Predefined marker list
+
+Selected markers (same as in original pre-print 3G figure)
+
+```{r}
+## panel G: Abundance heatmap
+markers_to_plot <- c(
+  "B2M",
+  "CD45",
+  "HLA-ABC",
+  "CD26",
+  "CD82",
+  "CD8",
+  "CD2",
+  "CD3E",
+  "HLA-DR",
+  "CD25",
+  "CD18",
+  "CD43",
+  "CD44",
+  "CD5",
+  "CD52",
+  "CD11a",
+  "CD29",
+  "CD7",
+  "CD55",
+  "CD71",
+  "CD48",
+  "CD45RB",
+  "CD150",
+  "CD49D",
+  "CD50",
+  "CD47",
+  "CD86",
+  "CD84",
+  "CD58",
+  "CD37",
+  "CD102",
+  "CD38",
+  "CD59",
+  "CD162",
+  "CD27",
+  "CD45RA",
+  "CD54",
+  "CD278",
+  "CD4",
+  "FMC63"
+)
+
+sample_order <- distinct(
+  data_t0_b1b2@meta.data |> select(sample_alias, donor, timepoint)
+) |>
+  arrange(timepoint) |>
+  pull(sample_alias)
+
+# Fetch abundance data per cell type and donor
+plot_data_clr <- FetchData(
+  data_t0_b1b2,
+  c("sample_alias", "celltype", markers_to_plot),
+  layer = "data"
+)
+
+# Summarize abundace data
+plot_data <- plot_data_clr |>
+  pivot_longer(
+    cols = all_of(markers_to_plot),
+    names_to = "marker",
+    values_to = "abundance"
+  ) |>
+  mutate(metric = "CLR") |>
+  group_by(sample_alias, celltype, marker) |>
+  summarise(
+    mean_clr = mean(abundance, na.rm = TRUE),
+    sd_clr = sd(abundance, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+cell_types <- plot_data$celltype |> unique()
+# cell_select <- cells_plot[1]
+for (cell_select in cell_types) {
+  # Prepare heatmap data
+  hm_data <-
+    plot_data |>
+    filter(celltype == cell_select) |>
+    group_by(sample_alias, marker) |>
+    select(marker, sample_alias, mean_clr) |>
+    # Pivot to wide format for heatmap
+    pivot_wider(
+      names_from = sample_alias,
+      values_from = mean_clr,
+      values_fill = 0
+    ) |>
+    column_to_rownames("marker") |>
+    t() |>
+    as.matrix()
+
+  # Plot heatmap
+  effect_vals <- as.numeric(hm_data)
+  effect_quantiles <- quantile(effect_vals, probs = c(0.01, 0.99), na.rm = TRUE)
+  max_abs_effect <- max(abs(effect_quantiles))
+  breaks_range <- seq(0, max_abs_effect, length.out = 101)
+  sample_order <- intersect(sample_order, rownames(hm_data))
+
+  lims <- c(0, 5)
+  col_fun <- circlize::colorRamp2(
+    seq(lims[1], lims[2], length.out = 100),
+    retro_palette(100)
+  )
+
+  hm <-
+    hm_data[sample_order, markers_to_plot] |>
+    pheatmap(
+      color = col_fun,
+      border_color = "white",
+      cellwidth = 10,
+      cellheight = 10,
+      cluster_rows = F,
+      cluster_cols = F,
+      heatmap_legend_param = list(title = "Mean CLR"),
+      fontsize = 7,
+      angle_col = "45",
+      main = paste0("Marker abundance in ", cell_select, " cells")
+    ) |>
+    ggplotify::as.ggplot()
+
+  export_plot(
+    filename = glue::glue(here::here(
+      "mpx_2",
+      "results/b1b2_t0t1/revised_figs/3G_selected_marker_heatmap/{cell_select}_abundance_clr_per_donor"
+    )),
+    plot = hm,
+    width = 8,
+    height = 4
+  )
+}
+```
+
+\
+
+### Markers based on data
+
+Identify new markers to plot
+
+```{r}
+DefaultAssay(data_t0_b1b2) <- "mpxCells"
+data_t0_b1b2@meta.data <- data_t0_b1b2@meta.data |>
+  mutate(
+    patient = donor
+  )
+samples_plot <- data_t0_b1b2@meta.data |>
+  filter(timepoint == "t0") |>
+  pull(sample) |>
+  unique()
+ct_1 <- "CD8 T FMC63+"
+ct_2 <- "CD8 T FMC63-"
+# Minimum cells per sample and cell type for a mean CLR to be computed
+min_cells_per_sample <- min_cells_default
+```
+
+```{r}
+#| label: marker-selection-criteria
+
+selected_markers <- FilterMarkers(
+  data_t0_b1b2 |> subset(timepoint == "t0"),
+  threshold = 0.5,
+  min_samples = 1,
+  min_percent = 0.1,
+  sample_col = "sample",
+  group_vars = "celltype",
+  layer = "data",
+  return_stats = FALSE
+)
+
+cd8_celltypes <- c("CD8 T FMC63-", "CD8 T FMC63+")
+stopifnot(all(cd8_celltypes %in% names(selected_markers)))
+markers_selected <- unique(unlist(selected_markers[cd8_celltypes]))
+```
+
+```{r fig.width=10, fig.height=5}
+fetch_abundance <- function(ct_label, min_cells = min_cells_per_sample) {
+  abundance <- data_t0_b1b2 %>%
+    subset(celltype == ct_label & sample %in% samples_plot) |>
+    FetchData(
+      vars = c("patient", markers_selected),
+      assay = "mpxCells",
+      layer = "data"
+    ) %>%
+    group_by(patient) %>%
+    summarise(
+      n_cells = n(),
+      across(all_of(markers_selected), \(x) mean(x, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  # Report and drop samples with too few cells of this type
+  too_few <- abundance |> filter(n_cells < min_cells)
+  if (nrow(too_few) > 0) {
+    message(
+      ct_label,
+      ": excluded (fewer than ",
+      min_cells,
+      " cells): ",
+      paste0(too_few$patient, " (", too_few$n_cells, ")", collapse = ", ")
+    )
+  }
+
+  abundance |>
+    filter(n_cells >= min_cells) |>
+    select(-n_cells) |>
+    mutate(celltype = ct_label)
+}
+
+abundance_combined <- bind_rows(
+  fetch_abundance(ct_1),
+  fetch_abundance(ct_2)
+)
+
+mat <- abundance_combined[, c("patient", "celltype", markers_selected)] |>
+  as.data.frame() |>
+  unite("row_id", patient, celltype, sep = " | ", remove = TRUE) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+ct_split <- abundance_combined$celltype
+patient_split <- abundance_combined$patient
+
+ct_colors <- c(ct_1 = "#4A0180", ct_2 = "#AD5BCD")
+names(ct_colors) <- c(ct_1, ct_2)
+
+row_ann <- rowAnnotation(
+  `Cell type` = ct_split,
+  `Patient` = patient_split,
+  col = list(
+    `Cell type` = ct_colors,
+    `Patient` = pal_donor
+  ),
+  annotation_name_gp = gpar(fontsize = 10),
+  annotation_name_rot = 45,
+  annotation_name_side = "top",
+  show_legend = TRUE
+)
+
+lims <- c(0, 5)
+col_fun <- circlize::colorRamp2(
+  seq(lims[1], lims[2], length.out = 100),
+  retro_palette(100)
+)
+
+ht <- Heatmap(
+  mat,
+  name = "Abundance\n(CLR)",
+  col = col_fun,
+  row_split = ct_split,
+  cluster_rows = FALSE,
+  cluster_row_slices = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = TRUE,
+  column_dend_height = unit(10, "mm"),
+  left_annotation = row_ann,
+  row_title = NULL,
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  # row_names_gp = gpar(fontsize = 10),
+  show_row_names = FALSE,
+  rect_gp = gpar(col = "white", lwd = 1),
+  width = unit(1, "snpc"),
+  height = unit(0.3, "snpc"),
+  column_title = "Protein abundance in CD8 T cells (t0)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+ht_drawn <- draw(ht, merge_legend = TRUE)
+# Column (marker) order after clustering, reused for the difference heatmap
+marker_order <- colnames(mat)[column_order(ht_drawn)]
+
+pdf(
+  here(
+    "mpx_2",
+    "results/b1b2_t0t1/revised_figs/3G_marker_heatmap_abundance_clr_per_donor.pdf" # Manuscript: Main Figure 3G
+  ),
+  width = 12
+)
+draw(ht, merge_legend = TRUE)
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results/b1b2_t0t1/revised_figs/3G_marker_heatmap_abundance_clr_per_donor.png"
+  ),
+  width = 16,
+  height = 8,
+  units = "in",
+  res = 300
+)
+draw(ht, merge_legend = TRUE)
+dev.off()
+
+# Mean difference in CLR across donors: CD8 T FMC63+ minus CD8 T FMC63-.
+# The difference is computed within each donor first (paired), then averaged,
+# using only donors with at least min_cells_per_sample cells of both types.
+abundance_diff_per_donor <- abundance_combined |>
+  tidyr::pivot_longer(
+    all_of(markers_selected),
+    names_to = "marker",
+    values_to = "mean_clr"
+  ) |>
+  tidyr::pivot_wider(names_from = celltype, values_from = mean_clr) |>
+  filter(!is.na(.data[[ct_1]]), !is.na(.data[[ct_2]])) |>
+  mutate(diff_clr = .data[[ct_1]] - .data[[ct_2]])
+
+n_donors_diff <- n_distinct(abundance_diff_per_donor$patient)
+
+abundance_diff_mean <- abundance_diff_per_donor |>
+  summarise(
+    mean_diff_clr = mean(diff_clr),
+    sd_diff_clr = sd(diff_clr),
+    n_donors = n(),
+    .by = marker
+  )
+
+# Table behind the heatmap, including the spread across donors
+
+mat_diff <- abundance_diff_mean |>
+  select(marker, mean_diff_clr) |>
+  tidyr::pivot_wider(names_from = marker, values_from = mean_diff_clr) |>
+  as.matrix()
+rownames(mat_diff) <- paste0("Mean across donors (n=", n_donors_diff, ")")
+mat_diff <- mat_diff[, marker_order, drop = FALSE]
+
+# Symmetric colour scale around 0
+diff_lim <- max(abs(mat_diff), na.rm = TRUE)
+col_fun_diff <- circlize::colorRamp2(
+  c(-diff_lim, 0, diff_lim),
+  pal_org_bl
+)
+
+ht_diff <- Heatmap(
+  mat_diff,
+  name = "Mean CLR\ndifference\n(FMC63+ - FMC63-)",
+  col = col_fun_diff,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE, # keep the marker order of the abundance heatmap
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 10),
+  rect_gp = gpar(col = "white", lwd = 1),
+  # Fixed sizes matching the abundance heatmap in its 16 x 8 in PNG (where
+  # 1 snpc = 8 in): 8 in wide, rows as tall as one abundance heatmap row
+  width = unit(8, "in"),
+  height = unit(8 * 0.3 / nrow(mat), "in"),
+  column_title = paste0(
+    "Mean protein abundance difference, ",
+    ct_1,
+    " vs ",
+    ct_2,
+    " (t0)"
+  ),
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+draw(ht_diff)
+
+pdf(
+  here(
+    "mpx_2",
+    "results/b1b2_t0t1/revised_figs/3G_marker_heatmap_abundance_clr_diff_mean.pdf"
+  ),
+  width = 12,
+  height = 3
+)
+draw(ht_diff)
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results/b1b2_t0t1/revised_figs/3G_marker_heatmap_abundance_clr_diff_mean.png"
+  ),
+  width = 16,
+  height = 3,
+  units = "in",
+  res = 300
+)
+draw(ht_diff)
+dev.off()
+
+
+# Stacked heatmap
+# Difference matrix in the SAME column order as mat (heatmaps in a vertical list
+# are aligned by position; the main heatmap's clustering reorders both)
+mat_diff_stack <- mat_diff[, colnames(mat), drop = FALSE]
+cell_h <- unit(8 * 0.3 / nrow(mat), "in") # row height used by the abundance heatmap
+
+ht_top <- Heatmap(
+  mat,
+  name = "Abundance\n(CLR)",
+  col = col_fun,
+  row_split = ct_split,
+  cluster_rows = FALSE,
+  cluster_row_slices = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = TRUE,
+  column_dend_height = unit(10, "mm"),
+  left_annotation = row_ann,
+  row_title = NULL,
+  show_row_names = FALSE,
+  show_column_names = FALSE, # names are drawn once, under the bottom heatmap
+  rect_gp = gpar(col = "white", lwd = 1),
+  width = unit(8, "in"),
+  height = cell_h * nrow(mat)
+)
+
+ht_bottom <- Heatmap(
+  mat_diff_stack,
+  name = "Mean CLR\ndifference\n(FMC63+ - FMC63-)",
+  col = col_fun_diff,
+  cluster_rows = FALSE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  rect_gp = gpar(col = "white", lwd = 1),
+  height = cell_h * nrow(mat_diff_stack)
+)
+
+ht_stack <- ht_top %v% ht_bottom
+
+draw(
+  ht_stack,
+  merge_legend = TRUE,
+  ht_gap = unit(3, "mm"),
+  column_title = "Protein abundance in CD8 T cells (t0)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+pdf(
+  here(
+    "mpx_2",
+    "results/b1b2_t0t1/revised_figs/3G_marker_heatmap_abundance_clr_stack.pdf"
+  ),
+  width = 12,
+  height = 6
+)
+draw(
+  ht_stack,
+  merge_legend = TRUE,
+  ht_gap = unit(3, "mm"),
+  column_title = "Protein abundance in CD8 T cells (t0)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results/b1b2_t0t1/revised_figs/3G_marker_heatmap_abundance_clr_stack.png"
+  ),
+  width = 16,
+  height = 6,
+  units = "in",
+  res = 300
+)
+draw(
+  ht_stack,
+  merge_legend = TRUE,
+  ht_gap = unit(3, "mm"),
+  column_title = "Protein abundance in CD8 T cells (t0)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+dev.off()
+```
+
+
+## 3X: Cell layouys
+
+## 4B: 2D cell layout
+
+For FMC63 and CD82
+
+```{r}
+#| label: fig3_x_cell_layout_data
+
+celltype_plot <- "CD8 T FMC63+"
+plot_markers <- c("CD26", "CD45RA")
+n_cells_plot <- 3
+# donors_select <- c()
+
+# Select components based on marker abundance
+data_t0_b1b2$component <- data_t0_b1b2@meta.data |> rownames()
+components_select_fmc <- FetchData(
+  data_t0_b1b2 |>
+    subset(celltype == celltype_plot),
+  vars = c("component", plot_markers),
+  layer = "data"
+) |>
+  left_join(
+    data_t0_b1b2@meta.data |>
+      filter(celltype == celltype_plot) |>
+      select(component, celltype, donor, timepoint),
+    by = "component"
+  ) |>
+  filter(
+    celltype == celltype_plot,
+    timepoint == "t0"
+  ) |>
+  tidyr::pivot_longer(
+    all_of(plot_markers),
+    names_to = "marker",
+    values_to = "mean_clr"
+  ) |>
+  group_by(donor) |>
+  slice_max(order_by = mean_clr, n = n_cells_plot) |>
+  pull(component) |>
+  unique()
+
+data_cell_plot <- data_t0_b1b2 |> subset(cells = components_select_fmc)
+
+DefaultAssay(data_cell_plot) <- "mpxCells"
+data_cell_plot <- data_cell_plot |>
+  LoadCellGraphs(load_layouts = TRUE, force = TRUE) |>
+  ComputeLayout(layout_method = "wpmds", dim = 2)
+```
+
+```{r}
+#| label: fig3_x_cell_layout_plots
+
+data_cell_plot_gi <- data_cell_plot
+
+for (comp in components_select_fmc) {
+  cg <- CellGraphs(data_cell_plot_gi)[[comp]]
+  g <- CellGraphData(cg, "cellgraph")
+  counts <- CellGraphData(cg, "counts")
+  gi_mat <- local_G(g, counts, k = 4)
+  gi_mat[gi_mat > quantile(gi_mat, 0.99)] <- quantile(gi_mat, 0.99)
+  CellGraphData(cg, "counts") <- as(gi_mat, "dgCMatrix")
+  CellGraphs(data_cell_plot_gi)[[comp]] <- cg
+}
+
+cell_labels <- data_cell_plot_gi@meta.data |>
+  filter(component %in% components_select_fmc) |>
+  select(component, patient) |>
+  arrange(patient, component) |>
+  group_by(patient) |>
+  mutate(label = str_trunc(component, side = "right", width = 15)) |>
+  ungroup() |>
+  select(component, label) |>
+  tibble::deframe()
+
+cells_named <- setNames(
+  components_select_fmc,
+  cell_labels[components_select_fmc]
+)
+
+p_list <- lapply(plot_markers, function(m) {
+  plots <- lapply(seq_along(cells_named), function(i) {
+    Plot2DGraph(
+      data_cell_plot_gi,
+      cells = cells_named[[i]],
+      layout_method = "wpmds",
+      marker = m,
+      colors = cherry_gradient(11),
+      collect_scales = FALSE,
+      node_size = 0.2
+    ) +
+      ggtitle(names(cells_named)[[i]]) +
+      theme(
+        plot.title = element_text(size = 6),
+        legend.position = "none"
+      )
+  })
+  p <- wrap_plots(plots, ncol = 5) &
+    patchwork::plot_annotation(title = m)
+  return(p)
+})
+
+pdf(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "3x_cell_layout_cd8_cart_cells_t0_localG_abundance.pdf" # Manuscript: Main Figure 3H (markers CD26 and CD45RA, donor B)
+  ),
+  width = 10,
+  height = 10
+)
+for (p in p_list) {
+  print(p)
+}
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "3x_cell_layout_cd8_cart_cells_t0_localG_abundance.png"
+  ),
+  width = 10,
+  height = 10 * length(p_list),
+  units = "in",
+  res = png_res
+)
+Reduce("/", p_list)
+dev.off()
+```
+
+
+
+# Figure 4
+
+## 4A: Polarity score in FMC63+ CD8+ T cells
+
+```{r}
+#| label: fmc63-polarity_pos
+
+# Abundance-based marker pre-filtering (as in the raw colocalization heatmaps):
+# a marker is kept if its mean CLR is at or above pol_min_mean_clr in every t0 sample
+# with >= pol_min_cells cells of this cell type
+pol_celltype <- "CD8 T FMC63+"
+pol_min_cells <- min_cells_default
+pol_min_mean_clr <- 0.5
+
+pol_markers <- pseudobulk_mean_clr(
+  subset(data_t0_b1b2, timepoint == "t0" & celltype == pol_celltype),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  min_cells = pol_min_cells
+)$sample_means |>
+  summarise(min_sample_mean_clr = min(mean_clr), .by = marker) |>
+  filter(min_sample_mean_clr >= pol_min_mean_clr) |>
+  pull(marker)
+message(pol_celltype, ": ", length(pol_markers), " markers selected")
+
+data_t0_b1b2$component <- rownames(data_t0_b1b2@meta.data)
+pol_scores <- PolarizationScores(data_t0_b1b2) |>
+  left_join(
+    data_t0_b1b2@meta.data |>
+      select(component, celltype, donor, timepoint),
+    by = "component"
+  ) |>
+  # Previously: filter(marker %in% selected_markers[["CD8 T FMC63+"]])
+  filter(marker %in% pol_markers) |>
+  group_by(celltype, donor, marker, timepoint) |>
+  summarise(morans_z = mean(morans_z, na.rm = TRUE), .groups = "drop")
+
+pol_mat <- pol_scores |>
+  filter(celltype == "CD8 T FMC63+", timepoint == "t0") |>
+  unite("row_id", donor, sep = " | ") |>
+  select(row_id, marker, morans_z) |>
+  pivot_wider(names_from = marker, values_from = morans_z) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+pol_mat[is.na(pol_mat)] <- 0
+
+row_meta <- pol_scores |>
+  select(donor) |>
+  distinct() |>
+  arrange(donor)
+
+pol_col_fun <- circlize::colorRamp2(
+  seq(0, 6, length.out = 100),
+  cherry_gradient(100)
+)
+
+pol_row_ann <- rowAnnotation(
+  `Donor` = row_meta$donor,
+  col = list(
+    `Donor` = pal_donor
+  ),
+  annotation_name_gp = gpar(fontsize = 10),
+  annotation_name_side = "top",
+  show_legend = TRUE
+)
+
+ht_pol <- Heatmap(
+  pol_mat,
+  name = "Polarity\n(Moran's Z)",
+  col = pol_col_fun,
+  cluster_rows = FALSE,
+  cluster_row_slices = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = TRUE,
+  column_dend_height = unit(10, "mm"),
+  # left_annotation  = pol_row_ann,
+  row_title = NULL,
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  row_names_side = "left",
+  show_row_names = TRUE,
+  rect_gp = gpar(col = "white", lwd = 1),
+  width = ncol(pol_mat) * unit(5, "mm"),
+  height = nrow(pol_mat) * unit(5, "mm"),
+  column_title = "Protein polarity of FMC63+ CD8 T cells",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+pol_caption <- glue::glue(
+  "Mean Moran's Z per patient at t0. Markers selected based on abundance CLR >= {pol_min_mean_clr} \\
+  in every sample with >= {pol_min_cells} {pol_celltype} cells ({length(pol_markers)} markers)."
+)
+draw_pol_ht <- function() {
+  draw(
+    ht_pol,
+    merge_legend = TRUE,
+    padding = unit(c(10, 2, 2, 2), "mm")
+  )
+  grid::grid.text(
+    pol_caption,
+    x = unit(2, "mm"),
+    y = unit(2, "mm"),
+    just = c("left", "bottom"),
+    gp = grid::gpar(fontsize = 8, col = "grey30")
+  )
+}
+
+#Export
+polarity_markers_hm_plot <- colnames(pol_mat)[column_order(ht_pol)]
+
+pdf(
+  here("mpx_2", "results", "b1b2_t0t1", "revised_figs", "4A_polarity.pdf"), # Manuscript: Main Figure 4A
+  width = 10,
+  height = 3
+)
+draw_pol_ht()
+dev.off()
+
+png(
+  here("mpx_2", "results", "b1b2_t0t1", "revised_figs", "4A_polarity.png"),
+  width = 10,
+  height = 3,
+  units = "in",
+  res = png_res
+)
+draw_pol_ht()
+dev.off()
+```
+
+
+```{r}
+#| label: fmc63-polarity_neg
+
+# Abundance-based marker pre-filtering (as in the raw colocalization heatmaps):
+# a marker is kept if its mean CLR is at or above pol_min_mean_clr in every t0 sample
+# with >= pol_min_cells cells of this cell type
+pol_celltype <- "CD8 T FMC63-"
+pol_min_cells <- min_cells_default
+pol_min_mean_clr <- 0.5
+
+pol_markers <- pseudobulk_mean_clr(
+  subset(data_t0_b1b2, timepoint == "t0" & celltype == pol_celltype),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  min_cells = pol_min_cells
+)$sample_means |>
+  summarise(min_sample_mean_clr = min(mean_clr), .by = marker) |>
+  filter(min_sample_mean_clr >= pol_min_mean_clr) |>
+  pull(marker)
+message(pol_celltype, ": ", length(pol_markers), " markers selected")
+
+data_t0_b1b2$component <- rownames(data_t0_b1b2@meta.data)
+pol_scores <- PolarizationScores(data_t0_b1b2) |>
+  left_join(
+    data_t0_b1b2@meta.data |>
+      select(component, celltype, donor, timepoint),
+    by = "component"
+  ) |>
+  # Previously: filter(marker %in% selected_markers[["CD8 T FMC63-"]])
+  filter(marker %in% pol_markers) |>
+  group_by(celltype, donor, marker, timepoint) |>
+  summarise(morans_z = mean(morans_z, na.rm = TRUE), .groups = "drop")
+
+pol_mat <- pol_scores |>
+  filter(celltype == "CD8 T FMC63-", timepoint == "t0") |>
+  unite("row_id", donor, sep = " | ") |>
+  select(row_id, marker, morans_z) |>
+  pivot_wider(names_from = marker, values_from = morans_z) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+pol_mat[is.na(pol_mat)] <- 0
+
+row_meta <- pol_scores |>
+  select(donor) |>
+  distinct() |>
+  arrange(donor)
+
+pol_col_fun <- circlize::colorRamp2(
+  seq(0, 6, length.out = 100),
+  cherry_gradient(100)
+)
+
+pol_row_ann <- rowAnnotation(
+  `Donor` = row_meta$donor,
+  col = list(
+    `Donor` = pal_donor
+  ),
+  annotation_name_gp = gpar(fontsize = 10),
+  annotation_name_side = "top",
+  show_legend = TRUE
+)
+
+ht_pol <- Heatmap(
+  pol_mat,
+  name = "Polarity\n(Moran's Z)",
+  col = pol_col_fun,
+  cluster_rows = FALSE,
+  cluster_row_slices = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = TRUE,
+  column_dend_height = unit(10, "mm"),
+  # left_annotation  = pol_row_ann,
+  row_title = NULL,
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  row_names_side = "left",
+  show_row_names = TRUE,
+  rect_gp = gpar(col = "white", lwd = 1),
+  width = ncol(pol_mat) * unit(5, "mm"),
+  height = nrow(pol_mat) * unit(5, "mm"),
+  column_title = "Protein polarity of FMC63- CD8 T cells",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+pol_caption <- glue::glue(
+  "Mean Moran's Z per patient at t0. Markers selected based on abundance CLR >= {pol_min_mean_clr} \\
+  in every sample with >= {pol_min_cells} {pol_celltype} cells ({length(pol_markers)} markers)."
+)
+draw_pol_ht <- function() {
+  draw(
+    ht_pol,
+    merge_legend = TRUE,
+    padding = unit(c(10, 2, 2, 2), "mm")
+  )
+  grid::grid.text(
+    pol_caption,
+    x = unit(2, "mm"),
+    y = unit(2, "mm"),
+    just = c("left", "bottom"),
+    gp = grid::gpar(fontsize = 8, col = "grey30")
+  )
+}
+
+draw_pol_ht()
+
+pdf(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4A_polarity_fmc63neg.pdf"
+  ),
+  width = 10,
+  height = 3
+)
+draw_pol_ht()
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4A_polarity_fmc63neg.png"
+  ),
+  width = 10,
+  height = 3,
+  units = "in",
+  res = png_res
+)
+draw_pol_ht()
+dev.off()
+```
+
+
+## 4B: 2D cell layout
+
+For FMC63 and CD82
+plot all polarity_markers_hm_plot
+
+```{r}
+#| label: fig4_b_fmc63_polarization
+
+marker_to_plot <- "FMC63"
+n_cells_plot <- 5
+# donors_select <- c()
+
+data_t0_b1b2$component <- data_t0_b1b2@meta.data |> rownames()
+components_select_fmc <- PolarizationScores(
+  data_t0_b1b2,
+  add_marker_counts = TRUE
+) |>
+  left_join(
+    data_t0_b1b2@meta.data |>
+      select(component, celltype, donor, timepoint),
+    by = "component"
+  ) |>
+  filter(
+    celltype == "CD8 T FMC63+",
+    marker == "FMC63",
+    timepoint == "t0",
+    morans_p_adjusted < 0.01,
+    count > 100
+  ) |>
+  group_by(donor) |>
+  slice_max(order_by = morans_z, n = n_cells_plot) |>
+  pull(component) |>
+  unique()
+
+data_cell_plot <- data_t0_b1b2 |> subset(cells = components_select_fmc)
+
+DefaultAssay(data_cell_plot) <- "mpxCells"
+data_cell_plot <- data_cell_plot |>
+  LoadCellGraphs(load_layouts = TRUE, force = TRUE) |>
+  ComputeLayout(layout_method = "wpmds", dim = 2)
+```
+
+```{r}
+#| label: fig4_b_fmc63_polarization_plots
+
+data_cell_plot_gi <- data_cell_plot
+
+for (comp in components_select_fmc) {
+  cg <- CellGraphs(data_cell_plot_gi)[[comp]]
+  g <- CellGraphData(cg, "cellgraph")
+  counts <- CellGraphData(cg, "counts")
+  gi_mat <- local_G(g, counts, k = 4)
+  gi_mat[gi_mat > quantile(gi_mat, 0.99)] <- quantile(gi_mat, 0.99)
+  CellGraphData(cg, "counts") <- as(gi_mat, "dgCMatrix")
+  CellGraphs(data_cell_plot_gi)[[comp]] <- cg
+}
+
+# plot_markers <- c("FMC63", "CD82")
+plot_markers <- c(
+  "FMC63",
+  head(polarity_markers_hm_plot, n = 5),
+  tail(polarity_markers_hm_plot, n = 5)
+) |>
+  unique()
+
+cell_labels <- data_cell_plot_gi@meta.data |>
+  filter(component %in% components_select_fmc) |>
+  select(component, donor) |>
+  arrange(donor, component) |>
+  group_by(donor) |>
+  mutate(label = str_trunc(component, side = "right", width = 15)) |>
+  ungroup() |>
+  select(component, label) |>
+  tibble::deframe()
+
+cells_named <- setNames(
+  components_select_fmc,
+  cell_labels[components_select_fmc]
+)
+
+p_list <- lapply(plot_markers, function(m) {
+  message(m)
+  plots <- lapply(seq_along(cells_named), function(i) {
+    Plot2DGraph(
+      data_cell_plot_gi,
+      cells = cells_named[[i]],
+      layout_method = "wpmds",
+      marker = m,
+      colors = cherry_gradient(11),
+      collect_scales = FALSE,
+      node_size = 0.2
+    ) +
+      ggtitle(names(cells_named)[[i]]) +
+      theme(
+        plot.title = element_text(size = 6),
+        legend.position = "none"
+      )
+  })
+  p <- wrap_plots(plots, ncol = 5) &
+    patchwork::plot_annotation(title = m)
+  return(p)
+})
+names(p_list) <- plot_markers
+
+pdf(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4B_cell_layout_cd8_cart_cells_t0_localG.pdf"
+  ),
+  width = 10,
+  height = 10
+)
+for (p in p_list) {
+  print(p)
+}
+dev.off()
+
+for (m in names(p_list)) {
+  p <- p_list[[m]]
+  png(
+    here(
+      "mpx_2",
+      "results",
+      "b1b2_t0t1",
+      "revised_figs",
+      glue::glue("4B_cell_layout_cd8_cart_cells_t0_localG_{m}.png") # Manuscript: Main Figure 4B (markers CD82, FMC63. Donors A, G, H)
+    ),
+    width = 10,
+    height = 10,
+    units = "in",
+    res = png_res
+  )
+  print(p)
+  dev.off()
+}
+# png(
+#   here(
+#     "mpx_2",
+#     "results",
+#     "b1b2_t0t1",
+#     "revised_figs",
+#     "4B_cell_layout_cd8_cart_cells_t0_localG.png"
+#   ),
+#   width = 10,
+#   height = 10 * length(p_list),
+#   units = "in",
+#   res = png_res
+# )
+# Reduce("/", p_list)
+# dev.off()
+```
+
+
+## 4C: Colocalization heatmap of all FMC63+ CD8+ T cells
+
+### Cell-level heatmap
+
+```{r}
+data_t0_b1b2$component <- NULL
+
+colocscores_dat <- ColocalizationScores(
+  data_t0_b1b2,
+  meta_data_columns = c(
+    "sample_alias",
+    "sample",
+    "donor",
+    "celltype",
+    "timepoint"
+  )
+)
+
+colocscores_dat$celltype_timepoint <- paste0(
+  colocscores_dat$celltype,
+  "_",
+  colocscores_dat$timepoint
+)
+
+colocscores_summarized <- SummarizeProximityScores(
+  colocscores_dat |>
+    rename(join_count_z = pearson_z),
+  group_vars = c("sample_alias", "donor", "celltype", "timepoint"),
+  proximity_metric = "join_count_z",
+  summary_stat = "mean",
+  include_missing_obs = T
+) |>
+  rename(mean_pearson_z = mean_join_count_z)
+```
+
+
+```{r}
+#| label: fig4_c_fmc63_colocalization_heatmap
+
+samples_plot <- colocscores_summarized |>
+  filter(timepoint == "t0") |>
+  pull(donor) |>
+  unique()
+coloc_dat_plot <- list()
+
+# Marker pre-filtering as in colocalization_raw_heatmap_per_cell_type_per_timepoint,
+# based on FMC63+ CD8 T cells only (FMC63- plot follows the FMC63+ markers):
+# a marker is kept if its mean CLR is at or above coloc_min_mean_clr in every sample
+# with >= coloc_min_cells cells
+coloc_min_cells <- min_cells_default
+coloc_min_mean_clr <- 0.5
+
+# Previous marker selection (FilterMarkers-based), replaced by the CLR filter below:
+# cd8t_markers <- unique(unlist(selected_markers[c(3, 4)]))
+
+pb_clr_4c <- pseudobulk_mean_clr(
+  subset(data_t0_b1b2, timepoint == "t0" & celltype == "CD8 T FMC63+"),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  min_cells = coloc_min_cells
+)
+pb_clr_4c$excluded # sample x cell type combinations below coloc_min_cells
+
+markers_pos <- pb_clr_4c$sample_means |>
+  summarise(min_sample_mean_clr = min(mean_clr), .by = marker) |>
+  filter(min_sample_mean_clr >= coloc_min_mean_clr) |>
+  pull(marker)
+stopifnot(length(markers_pos) >= 2)
+message("FMC63+ CD8 T: ", length(markers_pos), " markers selected")
+
+# Donors with >= coloc_min_cells cells per cell type (applied to both plots)
+donors_min_cells <- data_t0_b1b2@meta.data |>
+  filter(timepoint == "t0") |>
+  count(donor, celltype, name = "n_cells") |>
+  filter(n_cells >= coloc_min_cells)
+
+#' Prep data
+samples_neg <- donors_min_cells |>
+  filter(celltype == "CD8 T FMC63-", donor %in% samples_plot) |>
+  pull(donor)
+coloc_dat_plot[["CD8 T FMC63-"]] <- lapply(
+  samples_neg,
+  function(sample_select) {
+    scores_sample <- colocscores_summarized |>
+      filter(timepoint == "t0") |>
+      filter(marker_1 %in% markers_pos, marker_2 %in% markers_pos) |>
+      filter(celltype == "CD8 T FMC63-", donor == sample_select) |>
+      select(donor, marker_1, marker_2, mean_pearson_z)
+    return(scores_sample)
+  }
+) |>
+  bind_rows() |>
+  pivot_wider(names_from = donor, values_from = mean_pearson_z) |>
+  mutate(
+    mean_coloc_score = rowMeans(across(all_of(samples_neg)), na.rm = TRUE),
+    size_constant = 1
+  )
+
+samples_pos <- donors_min_cells |>
+  filter(celltype == "CD8 T FMC63+", donor %in% samples_plot) |>
+  pull(donor)
+coloc_dat_plot[["CD8 T FMC63+"]] <- lapply(
+  samples_pos,
+  function(sample_select) {
+    scores_sample <- colocscores_summarized |>
+      filter(timepoint == "t0") |>
+      filter(marker_1 %in% markers_pos, marker_2 %in% markers_pos) |>
+      filter(celltype == "CD8 T FMC63+", donor == sample_select) |>
+      select(donor, marker_1, marker_2, mean_pearson_z)
+    return(scores_sample)
+  }
+) |>
+  bind_rows() |>
+  pivot_wider(names_from = donor, values_from = mean_pearson_z) |>
+  mutate(
+    mean_coloc_score = rowMeans(across(all_of(samples_pos)), na.rm = TRUE),
+    size_constant = 1
+  )
+
+coloc_caption <- glue::glue(
+  "Only including samples with >= {coloc_min_cells} cells.
+  Markers selected based on FMC63+ abundance CLR >= {coloc_min_mean_clr}."
+)
+
+#' Plot for CAR+ T cells (reference: clustered, defines marker order)
+p2 <- ColocalizationHeatmap_custom(
+  coloc_dat_plot[["CD8 T FMC63+"]],
+  value_col = "mean_coloc_score",
+  size_col = "size_constant",
+  type = "dots",
+  clustering_method = "ward.D2",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  legend_range = c(-5, 5),
+  size_range = c(1, 4.5)
+) &
+  labs(
+    title = "FMC63+ CD8 T cells",
+    x = "",
+    y = "",
+    fill = "Mean\npearson Z\n(of donor mean)",
+    caption = coloc_caption
+  ) &
+  # scale_y_discrete(position = "right", limits = rev(m_order)) & # Add this if marker labels should be on right side
+  theme(
+    legend.position = "right",
+    axis.text = element_text(size = 8)
+  ) &
+  guides(size = "none")
+
+m_order <- ggplot2::ggplot_build(p2)$layout$panel_params[[1]]$x$get_labels()
+
+#' Plot for CAR- T cells (same markers and marker order as FMC63+)
+p1 <- ColocalizationHeatmap_custom(
+  coloc_dat_plot[["CD8 T FMC63-"]],
+  value_col = "mean_coloc_score",
+  size_col = "size_constant",
+  marker_order = m_order,
+  cluster_rows = F,
+  cluster_cols = F,
+  type = "dots",
+  legend_range = c(-5, 5),
+  size_range = c(1, 4.5)
+) &
+  labs(
+    title = "FMC63- CD8 T cells",
+    x = "",
+    y = "",
+    fill = "Mean\npearson Z\n(of donor mean)",
+    caption = coloc_caption
+  ) &
+  theme(legend.position = "none") &
+  guides(size = "none")
+
+export_plot(
+  here("mpx_2", "results", "b1b2_t0t1", "revised_figs", "4C_cd8_fmc63_pos_t0"),
+  p1 | p2,
+  width = 10,
+  height = 5
+)
+```
+
+
+```{r}
+# Data for each donor is available in the same table, `coloc_dat_plot`, with column headers for each donor
+# Plot for FMC63+ CD8 T cells. Plot according to the same order as the summarized data.
+coloc_p_donor_list <- lapply(samples_pos, function(d) {
+  n_cells_sample <- donors_min_cells |>
+    filter(celltype == "CD8 T FMC63+", donor == d) |>
+    pull(n_cells)
+  coloc_caption_donor <- glue::glue(
+    "Markers based on abundance (CLR >= {coloc_min_mean_clr}) in 
+    FMC63+ CD8 T cells present in samples with >= {coloc_min_cells} cells.
+    Showing T0 data for {d} ({n_cells_sample} cells) according to marker 
+    order from averaged scores across all selected samples"
+  )
+  p <- ColocalizationHeatmap_custom(
+    coloc_dat_plot[["CD8 T FMC63+"]],
+    value_col = d,
+    size_col = "size_constant",
+    marker_order = m_order,
+    cluster_rows = F,
+    cluster_cols = F,
+    type = "dots",
+    legend_range = c(-5, 5),
+    size_range = c(1, 4.5)
+  ) &
+    labs(
+      title = glue::glue("{d}: FMC63+ CD8 T cells (n={n_cells_sample})"),
+      x = "",
+      y = "",
+      fill = "Mean\npearson Z"
+      # caption = coloc_caption_donor
+    ) &
+    theme(legend.position = "right") &
+    guides(size = "none")
+  export_plot(
+    here(
+      "mpx_2",
+      "results",
+      "b1b2_t0t1",
+      "revised_figs",
+      glue::glue("4C_cd8_fmc63_pos_t0_{d}")
+    ),
+    p + labs(caption = coloc_caption_donor),
+    width = 6,
+    height = 5
+  )
+  p
+})
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4C_cd8_fmc63_pos_t0_all_donors"
+  ),
+  wrap_plots(coloc_p_donor_list, nrow = 2),
+  width = 16,
+  height = 9
+)
+```
+
+```{r}
+# Data for each donor is available in the same table, `coloc_dat_plot`, with column headers for each donor
+# Plot for FMC63- CD8 T cells. Plot according to the same order as the summarized data.
+coloc_p_donor_list <- lapply(samples_neg, function(d) {
+  n_cells_sample <- donors_min_cells |>
+    filter(celltype == "CD8 T FMC63-", donor == d) |>
+    pull(n_cells)
+  coloc_caption_donor <- glue::glue(
+    "Markers based on abundance (CLR >= {coloc_min_mean_clr}) in 
+    FMC63+ CD8 T cells present in samples with >= {coloc_min_cells} cells.
+    Showing T0 data for {d} ({n_cells_sample} cells) according to marker 
+    order from averaged scores across all selected samples"
+  )
+  p <- ColocalizationHeatmap_custom(
+    coloc_dat_plot[["CD8 T FMC63-"]],
+    value_col = d,
+    size_col = "size_constant",
+    marker_order = m_order,
+    cluster_rows = F,
+    cluster_cols = F,
+    type = "dots",
+    legend_range = c(-5, 5),
+    size_range = c(1, 4.5)
+  ) &
+    labs(
+      title = glue::glue("{d}: FMC63- CD8 T cells (n={n_cells_sample})"),
+      x = "",
+      y = "",
+      fill = "Mean\npearson Z"
+      # caption = coloc_caption_donor
+    ) &
+    theme(legend.position = "right") &
+    guides(size = "none")
+  export_plot(
+    here(
+      "mpx_2",
+      "results",
+      "b1b2_t0t1",
+      "revised_figs",
+      glue::glue("4C_cd8_fmc63_neg_t0_{d}")
+    ),
+    p + labs(caption = coloc_caption_donor),
+    width = 6,
+    height = 5
+  )
+  p
+})
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4C_cd8_fmc63_neg_t0_all_donors"
+  ),
+  wrap_plots(coloc_p_donor_list, nrow = 2),
+  width = 16,
+  height = 9
+)
+```
+
+
+### FMC63 extracted rows 
+
+### T0 bubbleplot FMC63 colocalization
+
+```{r}
+#| label: fig5d-fmc63-zoomin
+tp_select <- "t0"
+markers_plot <- c("FMC63", m_order)
+
+#' Prepare data
+fmc_coloc_data <- colocscores_summarized %>%
+  filter(celltype == "CD8 T FMC63+") |>
+  filter(timepoint == tp_select) |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63") |>
+  mutate(
+    to = ifelse(marker_1 == "FMC63", marker_2, marker_1),
+    from = ifelse(marker_2 == "FMC63", marker_2, marker_1)
+  ) |>
+  filter(to %in% markers_plot) |>
+  select(to, mean_pearson_z, donor) |>
+  mutate(
+    patient = donor,
+    marker = to
+  )
+
+fmc_coloc_per_donor_plot <- DifferentialBubblePlot(
+  data = fmc_coloc_data |>
+    mutate(patient = forcats::fct_rev(patient) |> as.character()) |>
+    mutate(patient = gsub("donor", "Donor ", patient)),
+  color_palette = colors,
+  has_pvalues = FALSE,
+  effect_cutoff = 0,
+  group_var = "patient",
+  size_range = 5,
+  color_range = c(-5, 5),
+  # cluster_rows = FALSE,
+  effect_col = "mean_pearson_z"
+) +
+  labs(
+    fill = "Mean\ncolocalization\n(pearson-z)",
+    title = "FMC63 colocalization in FMC63+ CD8+ T"
+  ) +
+  theme_linedraw() +
+  theme(
+    legend.position = "right",
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(t = 2, r = 0, b = 0, l = 0, unit = "cm")
+  )
+fmc_coloc_per_donor_plot
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4C_extra_fmc63_per_donor" # Manuscript: Main Figure 4C
+  ),
+  fmc_coloc_per_donor_plot,
+  width = 7,
+  height = 2.8
+)
+```
+
+
+## 4D: FMC63 network
+
+Selected markers with consistent positive and negative proximity scores with FMC63
+
+
+```{r fig.width=12, fig.height=6}
+#| label: fig4_d_fmc63_network
+
+#' Define markers
+tp_select <- "t0"
+
+# Abundance-based marker pre-filtering (as in the raw colocalization heatmaps):
+# a marker is kept if its mean CLR is at or above net_min_mean_clr in every t0 sample
+# with >= net_min_cells FMC63+ CD8 T cells
+net_celltype <- "CD8 T FMC63+"
+net_min_cells <- min_cells_default
+net_min_mean_clr <- 0.5
+
+# Previously: markers_selected <- unique(unlist(selected_markers[c(3, 4)]))
+markers_selected_clr <- pseudobulk_mean_clr(
+  subset(data_t0_b1b2, timepoint == tp_select & celltype == net_celltype),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  min_cells = net_min_cells
+)$sample_means |>
+  summarise(min_sample_mean_clr = min(mean_clr), .by = marker) |>
+  filter(min_sample_mean_clr >= net_min_mean_clr) |>
+  pull(marker)
+message(net_celltype, ": ", length(markers_selected_clr), " markers selected")
+
+# markers_plot <- base::union("FMC63", markers_selected)
+
+markers_plot <- base::union("FMC63", markers_selected_clr)
+
+coloc_dat_plot[["CD8 T FMC63+"]] |> pull(marker_1) |> unique()
+
+
+net_caption <- glue::glue(
+  "{net_celltype}, {tp_select}. Markers selected based on abundance CLR >= {net_min_mean_clr} \\
+  in every sample with >= {net_min_cells} cells ({length(markers_plot)} markers), \\
+  and |mean Pearson Z| > 0.25 for all patients.
+  Edge colour: mean Pearson Z per patient (capped at ±6)."
+)
+
+#' Prepare data
+df_net_fmc63_pos <- colocscores_summarized %>%
+  filter(celltype == "CD8 T FMC63+") |>
+  filter(timepoint == tp_select) |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63") |>
+  mutate(
+    to = ifelse(marker_1 == "FMC63", marker_2, marker_1),
+    from = ifelse(marker_2 == "FMC63", marker_2, marker_1)
+  ) |>
+  filter(to %in% markers_plot) |>
+  group_by(to) |>
+  filter(all(abs(mean_pearson_z) > 0.25)) |>
+  ungroup() |>
+  select(to, from, mean_pearson_z, sample, donor) |>
+  mutate(
+    patient = donor
+  )
+
+custom_limits <- c(-6, 6)
+
+#' Plot graph
+df_net_fmc63_pos_pos <- df_net_fmc63_pos |>
+  filter(mean_pearson_z > 0) |>
+  mutate(
+    mean_pearson_z_limit = ifelse(
+      mean_pearson_z > custom_limits[2],
+      custom_limits[2],
+      mean_pearson_z
+    )
+  )
+
+df_net_fmc63_pos_neg <- df_net_fmc63_pos |>
+  filter(mean_pearson_z < 0) |>
+  mutate(
+    mean_pearson_z_limit = ifelse(
+      mean_pearson_z < custom_limits[1],
+      custom_limits[1],
+      mean_pearson_z
+    )
+  )
+
+
+fmc63_network_pos <- tidygraph::as_tbl_graph(df_net_fmc63_pos_pos) %>%
+  ggraph(layout = "graphopt") +
+  geom_edge_link(aes(color = mean_pearson_z_limit), width = 2) +
+  geom_node_label(
+    aes(label = name, filter = name == "FMC63"),
+    fontface = "bold",
+    size = 3,
+    fill = "#FEFCDA",
+    label.padding = unit(0.3, "lines")
+  ) +
+  geom_node_text(aes(label = name, filter = name != "FMC63"), size = 3) +
+  facet_edges(~patient) +
+  scale_edge_color_gradientn(
+    colours = c("#233C62", "white", "#931b58"),
+    limits = custom_limits
+  ) +
+  labs(
+    title = "FMC63+ network (positive mean_pearson_z)",
+    caption = net_caption
+  ) +
+  coord_fixed(clip = "off") +
+  theme(
+    plot.caption = element_text(size = 8, hjust = 0),
+    # aspect.ratio = 1,
+    strip.background = element_rect(fill = NA),
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.background = element_rect(fill = "white"),
+    panel.spacing = unit(4, "lines"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+  )
+
+
+fmc63_network_neg <- tidygraph::as_tbl_graph(df_net_fmc63_pos_neg) %>%
+  ggraph(layout = "graphopt") +
+  geom_edge_link(aes(color = mean_pearson_z_limit), width = 2) +
+  geom_node_label(
+    aes(label = name, filter = name == "FMC63"),
+    fontface = "bold",
+    size = 3,
+    fill = "#FEFCDA",
+    label.padding = unit(0.3, "lines")
+  ) +
+  geom_node_text(aes(label = name, filter = name != "FMC63"), size = 3) +
+  facet_edges(~patient) +
+  scale_edge_color_gradientn(
+    colours = c("#233C62", "white", "#931b58"),
+    limits = custom_limits
+  ) +
+  labs(
+    title = "FMC63+ network (negative mean_pearson_z)",
+    caption = net_caption
+  ) +
+  coord_fixed(clip = "off") +
+  theme(
+    plot.caption = element_text(size = 8, hjust = 0),
+    # aspect.ratio = 1,
+    strip.background = element_rect(fill = NA),
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.background = element_rect(fill = "white"),
+    panel.spacing = unit(4, "lines"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+  )
+
+fmc63_network_pos
+fmc63_network_neg
+
+export_plot(
+  here("mpx_2", "results", "b1b2_t0t1", "revised_figs", "4D_fmc63_network_pos"), # Manuscript: Main Figure 4D (left)
+  fmc63_network_pos,
+  width = 12,
+  height = 8
+)
+
+export_plot(
+  here("mpx_2", "results", "b1b2_t0t1", "revised_figs", "4D_fmc63_network_neg"), # Manuscript: Main Figure 4D (right)
+  fmc63_network_neg,
+  width = 12,
+  height = 8
+)
+```
+
+## 4D alt: FMC63 network summarized
+
+```{r}
+#| label: fig4_d_fmc63_network_averaged
+
+#' FMC63 network averaged across donors (t0, CD8 T FMC63+).
+#' A partner is kept only if it is present in every donor and its
+#' mean_pearson_z has the same sign in every donor. Edges show the mean
+#' across donors. One network for positive, one for negative colocalization.
+
+tp_select <- "t0"
+ct_select <- "CD8 T FMC63+"
+
+# Abundance-based marker pre-filtering (as in the raw colocalization heatmaps):
+# a marker is kept if its mean CLR is at or above net_min_mean_clr in every t0 sample
+# with >= net_min_cells cells of this cell type
+net_min_cells <- min_cells_default
+net_min_mean_clr <- 0.5
+
+# Previously: markers_plot <- c("FMC63", markers_selected), with markers_selected
+# from unique(unlist(selected_markers[c(3, 4)]))
+markers_selected_clr <- pseudobulk_mean_clr(
+  subset(data_t0_b1b2, timepoint == tp_select & celltype == ct_select),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  min_cells = net_min_cells
+)$sample_means |>
+  summarise(min_sample_mean_clr = min(mean_clr), .by = marker) |>
+  filter(min_sample_mean_clr >= net_min_mean_clr) |>
+  pull(marker)
+message(ct_select, ": ", length(markers_selected_clr), " markers selected")
+
+markers_plot <- base::union("FMC63", markers_selected_clr)
+# Same magnitude threshold as the per-donor networks above; set to 0 to keep
+# every partner with a consistent sign
+min_abs_z <- 0.1 # 0.25
+custom_limits <- c(-6, 6)
+
+df_fmc63_per_donor <- colocscores_summarized |>
+  filter(celltype == ct_select, timepoint == tp_select) |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63", marker_1 != marker_2) |>
+  mutate(
+    to = ifelse(marker_1 == "FMC63", marker_2, marker_1),
+    from = "FMC63"
+  ) |>
+  filter(to %in% markers_plot) |>
+  select(from, to, donor, mean_pearson_z)
+
+n_donors_net <- n_distinct(df_fmc63_per_donor$donor)
+
+df_fmc63_avg <- df_fmc63_per_donor |>
+  summarise(
+    n_donors = n_distinct(donor),
+    all_pos = all(mean_pearson_z > min_abs_z),
+    all_neg = all(mean_pearson_z < -min_abs_z),
+    mean_z = mean(mean_pearson_z),
+    sd_z = sd(mean_pearson_z),
+    .by = c(from, to)
+  ) |>
+  # Present in every donor, with the same direction in every donor
+  filter(n_donors == n_donors_net, all_pos | all_neg) |>
+  mutate(
+    direction = ifelse(all_pos, "positive", "negative"),
+    mean_z_limit = pmin(pmax(mean_z, custom_limits[1]), custom_limits[2])
+  )
+
+readr::write_csv(
+  df_fmc63_avg,
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4D_fmc63_network_averaged.csv"
+  )
+)
+
+plot_avg_network <- function(edges, title) {
+  # No partner passed the filters: return a labelled empty panel instead of
+  # failing (a graph without edges has no FMC63 node to centre on)
+  if (nrow(edges) == 0) {
+    message(title, ": no partners pass the filters, drawing an empty panel")
+    return(
+      ggplot() +
+        annotate(
+          "text",
+          x = 0,
+          y = 0,
+          label = "No partners with the same sign in all donors"
+        ) +
+        labs(title = title) +
+        theme_void() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+    )
+  }
+
+  graph <- tidygraph::as_tbl_graph(
+    edges |> select(from, to, mean_z, mean_z_limit)
+  )
+  center_idx <- which(igraph::V(graph)$name == "FMC63")
+  ggraph(graph, layout = "star", center = center_idx) +
+    # The star layout puts partners on a unit circle. Fixed limits keep the
+    # panel square when all nodes fall on one line (1-2 partners), which would
+    # otherwise give a zero-height panel that breaks the repelled labels
+    expand_limits(x = c(-1.3, 1.3), y = c(-1.3, 1.3)) +
+    geom_edge_link(aes(color = mean_z_limit), width = 3) +
+    geom_node_label(
+      aes(label = name, filter = name == "FMC63"),
+      fontface = "bold",
+      size = 4,
+      fill = "#FEFCDA",
+      label.padding = unit(0.2, "lines")
+    ) +
+    # geom_node_label(
+    #   aes(label = name, filter = name != "FMC63")
+    #   size = 1,
+    #   fill = "#FEFCDA",
+    #   label.padding = unit(0.2, "lines")
+    # ) +
+    geom_node_text(
+      aes(label = name, filter = name != "FMC63"),
+      size = 4,
+      repel = FALSE
+    ) +
+    scale_edge_color_gradientn(
+      colours = c("#233C62", "white", "#931b58"),
+      limits = custom_limits,
+      name = "Mean\npearson_z"
+    ) +
+    labs(
+      title = title,
+    ) +
+    coord_fixed(clip = "off") +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 9)
+    )
+}
+
+edges_pos <- df_fmc63_avg |> filter(direction == "positive")
+edges_neg <- df_fmc63_avg |> filter(direction == "negative")
+
+fmc63_network_avg_pos <- plot_avg_network(
+  edges_pos,
+  "FMC63 colocalization network"
+)
+fmc63_network_avg_neg <- plot_avg_network(
+  edges_neg,
+  "FMC63 segregation network"
+)
+
+avg_caption <- glue::glue(
+  "{ct_select}, {tp_select}; mean of {n_donors_net} donors. Markers selected based on \\
+  abundance CLR >= {net_min_mean_clr} in every sample with >= {net_min_cells} cells \\
+  ({length(markers_selected_clr)} markers).
+  Partners shown have the same sign and \\
+  |Pearson Z| > {min_abs_z} in all donors."
+)
+
+p <- (fmc63_network_avg_pos | fmc63_network_avg_neg) +
+  patchwork::plot_annotation(
+    caption = avg_caption,
+    theme = theme(plot.caption = element_text(size = 7, hjust = 0))
+  )
+p
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "4D_fmc63_network_averaged_pos_neg"
+  ),
+  p,
+  width = 7,
+  height = 4.25
+)
+```
+
+
+
+# Figure 5
+
+## 5Aa: UMAPs
+
+
+```{r fig.width=16, fig.height=5}
+pt_size <- 0.1
+
+p1 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_t0t1_b1b2,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_type_palette_fmc,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters with FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- wrap_plots(p1, p2, ncol = 2)
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5Aa_umaps_t0t1" # Manuscript: Main Figure 5B
+  ),
+  plot = p,
+  width = 7 * 1.5,
+  height = 3 * 1.5
+)
+```
+
+## 5Ab: T0 T1 cell proportion changes
+
+```{r}
+data_t0t1_b1b2@meta.data |>
+  select(donor, celltype, timepoint) |>
+  filter(
+    celltype %in%
+      c(
+        "CD4 T FMC63-",
+        "CD4 T FMC63+",
+        "CD8 T FMC63-",
+        "CD8 T FMC63+",
+        "NK",
+        "T other"
+      )
+  ) |>
+  summarize(
+    n = n(),
+    .by = c(donor, celltype, timepoint)
+  ) |>
+  arrange(donor, celltype) |>
+  readr::write_csv(here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "cell_counts_t0t1.csv"
+  ))
+```
+
+### Sankey for each donor
+
+```{r}
+#' Create tables with data
+cellcluster_freq_t0t1_tbl <- data_t0t1_b1b2@meta.data |>
+  # filter(!celltype == "other") |>
+  filter(timepoint %in% c("t0", "t1")) |>
+  group_by(donor, timepoint, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype = as.factor(celltype))
+
+# cellcluster_freq_t0t1_tbl |> display_dt(rownames = FALSE)
+
+#' Plot
+p <- ggplot(
+  cellcluster_freq_t0t1_tbl,
+  # filter(!donor %in% c("donorD", "donorE")),
+  aes(y = pct, x = timepoint)
+) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .5, color = "black") +
+  facet_wrap(~donor, ncol = 6 + 2) +
+  scale_fill_manual(values = cell_type_palette_fmc) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  plot_annotation(
+    title = "Cell proportions across donors",
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold")
+    )
+  )
+p
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5A_celltype_proportions_sankey" # Manuscript: Main Figure 5C
+  ),
+  width = 14,
+  height = 4,
+  p = p
+)
+```
+
+### Sankey with pooled data (one plot)
+
+```{r}
+donors_include <- cellcluster_freq_t0t1_tbl$donor |> unique()
+donors_include <- donors_include[!donors_include %in% c("donorD", "donorE")]
+
+# Minimum cells per sample (donor and timepoint) for plots that combine donors
+# and have no other cell filter: here all cell types together, in the swarm plot
+# below the cells of the lineage (CD4 T or CD8 T)
+across_donor_min_cells <- min_cells_default
+
+cellcluster_freq_t0t1_tbl_pooled <- cellcluster_freq_t0t1_tbl |>
+  filter(donor %in% donors_include) |>
+  group_by(donor, timepoint) |>
+  filter(sum(n_cells) >= across_donor_min_cells) |>
+  group_by(timepoint, celltype) |>
+  summarize(n_cells = sum(n_cells)) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype = as.factor(celltype))
+
+#' Plot
+p <- ggplot(
+  cellcluster_freq_t0t1_tbl_pooled,
+  aes(y = pct, x = timepoint)
+) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .5, color = "black") +
+  scale_fill_manual(values = cell_type_palette_fmc) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  plot_annotation(
+    title = "Cell proportions",
+    subtitle = paste0(
+      "Aggregated cell count from donors ",
+      paste(gsub("donor", "", donors_include), collapse = ', ')
+    ),
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold")
+    )
+  )
+p
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5A_celltype_proportions_sankey_aggregated"
+  ),
+  width = 5,
+  height = 4,
+  p = p
+)
+```
+
+```{r}
+write.table(
+  x = cellcluster_freq_t0t1_tbl,
+  file = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5A_celltype_frequency_table.csv"
+  ),
+  sep = ",",
+  row.names = FALSE
+)
+```
+
+
+### Swarmplot with aggregated data
+
+```{r}
+tcell_types <- c("CD4 T FMC63-", "CD4 T FMC63+", "CD8 T FMC63-", "CD8 T FMC63+")
+
+# Share of FMC63+ cells among all CD4 / CD8 T cells, per donor and timepoint
+cellprop_fmc63_fraction_data <- cellcluster_freq_t0t1_tbl |>
+  ungroup() |>
+  mutate(celltype = as.character(celltype)) |>
+  filter(celltype %in% tcell_types) |>
+  # A donor/timepoint with no cells of a subtype has no row; add it as a 0
+  # count (only for donor/timepoint combinations that exist)
+  tidyr::complete(
+    tidyr::nesting(donor, timepoint),
+    celltype = tcell_types,
+    fill = list(n_cells = 0)
+  ) |>
+  mutate(
+    lineage = sub(" FMC63[+-]$", "", celltype),
+    fmc63_status = sub("^.* ", "", celltype)
+  ) |>
+  summarise(
+    n_fmc63_pos = sum(n_cells[fmc63_status == "FMC63+"]),
+    n_total = sum(n_cells),
+    .by = c(donor, timepoint, lineage)
+  ) |>
+  # A donor/timepoint is only shown for a lineage (CD4 T or CD8 T) with at least
+  # across_donor_min_cells cells of that lineage (set in the pooled Sankey chunk above);
+  # below that the fraction is too uncertain (a donor with no cells has no fraction)
+  filter(n_total >= across_donor_min_cells) |>
+  mutate(
+    fmc63_frequency = n_fmc63_pos / n_total,
+    lineage = factor(lineage, levels = c("CD4 T", "CD8 T")),
+    timepoint = factor(timepoint, levels = c("t0", "t1")),
+    # Paired = the donor has data at both timepoints for this lineage
+    paired = n_distinct(timepoint) == 2,
+    .by = c(donor, lineage)
+  )
+
+cellprop_fmc63_swarm_plot <- ggplot(
+  cellprop_fmc63_fraction_data,
+  aes(x = timepoint, y = fmc63_frequency)
+) +
+  # outlier.shape = NA: every donor is already drawn as a point below
+  geom_boxplot(outlier.shape = NA, width = 0.6, colour = "grey30") +
+  geom_line(
+    data = \(d) filter(d, paired),
+    aes(group = donor, colour = donor),
+    linewidth = 0.5,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    aes(group = donor, fill = donor),
+    shape = 21,
+    size = 2.5,
+    colour = "black",
+    stroke = 0.25
+  ) +
+  facet_wrap(~lineage) +
+  scale_fill_manual(values = pal_donor, labels = \(x) gsub("donor", "", x)) +
+  scale_colour_manual(values = pal_donor) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  geom_hline(yintercept = c(0, 1), linewidth = 0.25) +
+  theme_linedraw(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    aspect.ratio = 1.5,
+    axis.text = element_text(size = 10),
+    strip.background = element_rect(fill = NA),
+    strip.text = element_text(colour = "black", face = "bold")
+  ) +
+  labs(
+    x = "Timepoint",
+    y = "FMC63+ cells (% of lineage)",
+    title = "FMC63+ cell proportions, t0 vs t1",
+    fill = "Donor"
+  )
+cellprop_fmc63_swarm_plot
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5A_celltype_proportions_tcell_swarm" # Manuscript: Main Figure 5D
+  ),
+  plot = cellprop_fmc63_swarm_plot,
+  width = 4,
+  height = 3
+)
+```
+
+
+
+## 5B: CAR fraction longitudinal
+
+```{r}
+data_donorA <- readRDS(here(
+  "mpx",
+  "rdata",
+  "robj_suzuki_cart_processed_data_all.rds"
+)) |>
+  subset(donor %in% c("donor_32"))
+
+data_donorA@meta.data <- data_donorA@meta.data |>
+  mutate(
+    donor = case_when(
+      donor == 'donor_32' ~ 'donorA',
+      donor == 'donor_44' ~ 'donorB',
+      donor == 'donor_50' ~ 'donorC',
+      TRUE ~ donor
+    )
+  ) |>
+  mutate(
+    celltype = case_when(
+      celltype == 'CD4 T' ~ 'CD4 T FMC63-',
+      celltype == 'CD8 T' ~ 'CD8 T FMC63-',
+      TRUE ~ celltype
+    )
+  )
+
+cellcluster_freq_donorA_tbl <- data_donorA@meta.data |>
+  filter(!celltype == "other") |>
+  filter(!celltype == "Platelets") |>
+  group_by(donor, timepoint, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype = as.factor(celltype))
+```
+
+```{r}
+write.table(
+  x = cellcluster_freq_donorA_tbl,
+  file = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5A_celltype_frequency_table_donorA.csv"
+  ),
+  sep = ",",
+  row.names = FALSE
+)
+```
+
+(Yuki will do this based on the cell count table)
+
+
+## 5D: Differential abundance
+
+T1 vs T0 in FMC63+ cells
+
+### Cell-level
+
+```{r}
+#| label: fig-5-daa-cd8t
+
+cells_test <- c("CD8 T FMC63+", "CD8 T FMC63-")
+
+n_cell_count <- data_t0t1_b1b2@meta.data |>
+  subset(celltype %in% cells_test) |>
+  group_by(sample_alias, donor, timepoint, celltype) |>
+  summarise(n_cells = n())
+
+donors_exclude <- c("donorD", "donorE") # only PBMC samples - exclude
+samples_include <- n_cell_count |> # include only donors/samples with at least min_cells_default cells in both FMC63+/- CD8 T cells
+  filter(!donor %in% donors_exclude) |>
+  filter(n_cells >= min_cells_default) |>
+  group_by(sample_alias, timepoint) |>
+  summarize(n = n()) |>
+  filter(n == 2) |>
+  pull(sample_alias) |>
+  unique()
+
+# Not possible to split by donor due to low cell numbers (unless doing pseudobulk)
+daa_res <- RunDAA(
+  data_t0t1_b1b2 |>
+    subset(sample_alias %in% samples_include) |>
+    subset(celltype %in% cells_test),
+  contrast_column = "timepoint",
+  reference = "t0",
+  targets = "t1",
+  group_vars = c("celltype") # , "donor"
+)
+daa_res$patient <- "all_donors"
+```
+
+```{r}
+#| label: fig-5-heatmap
+#| fig-width: 12
+#| fig-height: 5
+
+daa_res_filtered <- daa_res |>
+  filter(marker %in% markers_selected_clr)
+
+# Prepare difference matrix (t1 vs t0)
+mat_diff <- daa_res_filtered |>
+  select(patient, celltype, marker, difference) |>
+  unite("row_id", celltype, patient, sep = " | ") |>
+  pivot_wider(names_from = marker, values_from = difference, values_fill = 0) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+# Prepare p_adj matrix for annotations
+mat_padj <- daa_res_filtered |>
+  select(patient, celltype, marker, p_adj) |>
+  unite("row_id", celltype, patient, sep = " | ") |>
+  pivot_wider(names_from = marker, values_from = p_adj, values_fill = 1) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+# Use if markers should be ordered:
+# marker_order_fig5 <- marker_order_mean_abundance[
+#   marker_order_mean_abundance %in% colnames(mat_diff)
+# ]
+# mat_diff <- mat_diff[, marker_order_fig5, drop = FALSE]
+# mat_padj <- mat_padj[, marker_order_fig5, drop = FALSE]
+
+# Ensure matching dimensions and order
+mat_padj <- mat_padj[rownames(mat_diff), colnames(mat_diff)]
+
+# Create significance matrix
+sig_mat <- matrix("", nrow = nrow(mat_padj), ncol = ncol(mat_padj))
+sig_mat[mat_padj < 0.05] <- "*"
+sig_mat[mat_padj < 0.01] <- "**"
+sig_mat[mat_padj < 0.001] <- "***"
+
+# Define row splits and annotations
+row_meta <- data.frame(row_id = rownames(mat_diff)) |>
+  separate(
+    row_id,
+    into = c("celltype", "patient"),
+    sep = " \\| ",
+    remove = FALSE
+  )
+
+# Colors
+lims <- round(max(abs(mat_diff), na.rm = TRUE) * 0.8, 0)
+col_fun <- circlize::colorRamp2(
+  seq(-lims, lims, length.out = 100),
+  retro_palette(100)
+)
+
+row_ann <- rowAnnotation(
+  `Cell type` = row_meta$celltype,
+  `Patient` = row_meta$patient,
+  col = list(
+    `Cell type` = c("CD8 T FMC63+" = "#4A0180", "CD8 T FMC63-" = "#AD5BCD")
+    # `Patient` = as.character(pal_donor)
+  ),
+  show_legend = TRUE,
+  annotation_name_side = "top",
+  annotation_name_rot = 45,
+  annotation_name_gp = gpar(fontsize = 10)
+)
+
+ht <- Heatmap(
+  mat_diff,
+  name = "Difference\n(t1 vs t0)",
+  col = col_fun,
+  heatmap_legend_param = list(
+    at = seq(-lims, lims, by = 2), # explicit tick marks
+    labels = as.character(seq(-lims, lims, by = 2)),
+    legend_height = unit(4, "cm")
+  ),
+  row_split = factor(
+    row_meta$celltype,
+    levels = c("CD8 T FMC63+", "CD8 T FMC63-")
+  ),
+  cluster_rows = FALSE,
+  cluster_row_slices = FALSE,
+  # cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_dend = TRUE,
+  left_annotation = row_ann,
+  rect_gp = gpar(col = "white", lwd = 1),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  width = ncol(mat_diff) * unit(5, "mm"),
+  height = nrow(mat_diff) * unit(5, "mm"),
+  row_title = NULL,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (sig_mat[i, j] != "") {
+      grid.text(
+        sig_mat[i, j],
+        x,
+        y,
+        vjust = 0.75,
+        gp = gpar(fontsize = 10, col = "black")
+      )
+    }
+  },
+  column_title = "Differential Abundance (t1 vs t0)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+draw(ht, merge_legend = TRUE)
+
+pdf(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5D_daa_heatmap_cell_level.pdf"
+  ),
+  width = 12,
+  height = 3
+)
+draw(ht, merge_legend = TRUE)
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5D_daa_heatmap_cell_level.png"
+  ),
+  width = 12,
+  height = 3,
+  units = "in",
+  res = png_res
+)
+draw(ht, merge_legend = TRUE)
+dev.off()
+```
+
+
+### Pseudobulk (unpaired)
+
+Sample-level alternative to the cell-level test above, using the same limma pseudobulk approach as the PNA analyses (`RunPseudobulkDAA()` in `scripts/R/pseudobulk_limma.R`). For each cell type, CLR values are averaged per sample (samples with at least 30 cells of that type), and t1 is compared to t0 across samples with limma, adjusting for batch. A cell type is only tested when it has at least 2 samples at each timepoint. The test is unpaired and includes all donors, so donors D and E (t1 only) contribute t1 samples. Note that t0 samples are CAR T product and t1 samples are PBMC, so the comparison also reflects the change in sample type.
+
+```{r}
+#| label: fig-5-daa-pseudobulk
+
+# Minimum cells per sample and cell type for the unpaired pseudobulk tests of
+# Fig 5 and Fig 6 (the DAA here and the DCA in Fig 6 use the same values), and
+# the minimum number of samples per group (t0 / t1) for a cell type to be tested.
+# A cutoff of 30 cells gives a sample mean precise enough for the colocalization
+# test (see min_cells_simulation/subsampling/subsampling_notes.md).
+pseudobulk_min_cells <- 30
+pseudobulk_min_samples_per_group <- 2
+
+daa_pseudobulk <- RunPseudobulkDAA(
+  data_t0t1_b1b2,
+  contrast_column = "timepoint",
+  reference = "t0",
+  target = "t1",
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  covariate_cols = "batch",
+  min_cells = pseudobulk_min_cells,
+  min_samples_per_group = pseudobulk_min_samples_per_group
+)
+
+# Samples per cell type used in the tests, and cell types that were skipped
+daa_pseudobulk$results |>
+  distinct(celltype, n_samples_reference, n_samples_target, covariates)
+daa_pseudobulk$skipped
+
+readr::write_csv(
+  daa_pseudobulk$results,
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5D_pseudobulk_analysis",
+    "5D_daa_pseudobulk_t1_vs_t0.csv"
+  )
+)
+readr::write_csv(
+  daa_pseudobulk$sample_means,
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5D_pseudobulk_analysis",
+    "5D_daa_pseudobulk_t1_vs_t0_sample_means.csv"
+  )
+)
+```
+
+#### Plot results: heatmap
+
+```{r}
+#| label: fig-5-daa-pseudobulk_plot_heatmap
+
+#' Heatmap of pseudobulk differential abundance for one or more cell types
+#'
+#' One row per cell type, one column per marker; cells show the difference
+#' (target - reference) and stars mark FDR-adjusted significance. Draws the
+#' heatmap and, if `filename` is given, saves it as PDF and PNG.
+#'
+#' @param results `results` table from RunPseudobulkDAA().
+#' @param cell_types Cell type(s) to show, one row each, in this order.
+#' @param markers Markers (columns) to show.
+#' @param filename Output path without extension; NULL to only draw.
+#' @param cluster_columns Cluster markers (TRUE), or FALSE to keep `markers`
+#'   order. Ignored when `column_order` is given.
+#' @param column_order Optional marker order to use instead of clustering, e.g.
+#'   the `column_order` returned for another cell type, so that several
+#'   heatmaps share the same columns.
+#' @param split_rows Split rows into one block per cell type, with gaps, as in
+#'   the cell-level 5D heatmap. Default: TRUE when more than one cell type.
+#' @param lims Colour scale limits (symmetric). NULL: 80% of the largest
+#'   absolute difference shown, rounded.
+#'
+#' @return Invisibly, a list with `heatmap` (the ComplexHeatmap object) and
+#'   `column_order` (the marker order as drawn).
+
+plot_pseudobulk_daa_heatmap <- function(
+  results,
+  cell_types,
+  markers = markers_selected,
+  filename = NULL,
+  cluster_columns = TRUE,
+  column_order = NULL,
+  lims = NULL,
+  split_rows = length(cell_types) > 1,
+  width = 12,
+  height = 2.5
+) {
+  res <- results |>
+    filter(celltype %in% cell_types, marker %in% markers)
+  missing_types <- setdiff(cell_types, res$celltype)
+  if (length(missing_types) > 0) {
+    warning(
+      "No pseudobulk results for: ",
+      paste(missing_types, collapse = ", "),
+      " (skipped by RunPseudobulkDAA?)",
+      call. = FALSE
+    )
+    cell_types <- intersect(cell_types, res$celltype)
+  }
+  if (length(cell_types) == 0) {
+    return(invisible(NULL))
+  }
+
+  row_info <- res |>
+    distinct(
+      celltype,
+      n_samples_reference,
+      n_samples_target,
+      target,
+      reference
+    ) |>
+    mutate(celltype = factor(celltype, levels = cell_types)) |>
+    arrange(celltype) |>
+    mutate(
+      celltype = as.character(celltype),
+      row_label = paste0(
+        celltype,
+        " (n = ",
+        n_samples_reference,
+        " / ",
+        n_samples_target,
+        ")"
+      )
+    )
+  contrast_label <- paste0(
+    row_info$target[[1]],
+    " vs ",
+    row_info$reference[[1]]
+  )
+
+  to_matrix <- function(value_col) {
+    res |>
+      select(celltype, marker, all_of(value_col)) |>
+      pivot_wider(names_from = marker, values_from = all_of(value_col)) |>
+      column_to_rownames("celltype") |>
+      as.matrix()
+  }
+  mat_diff <- to_matrix("difference")[row_info$celltype, , drop = FALSE]
+  if (!is.null(column_order)) {
+    # Shared order from another heatmap: markers not in it go last
+    cluster_columns <- FALSE
+    column_order <- c(
+      intersect(column_order, colnames(mat_diff)),
+      setdiff(colnames(mat_diff), column_order)
+    )
+    mat_diff <- mat_diff[, column_order, drop = FALSE]
+  } else if (!isTRUE(cluster_columns)) {
+    mat_diff <- mat_diff[, intersect(markers, colnames(mat_diff)), drop = FALSE]
+  }
+  mat_padj <- to_matrix("p_adj")[
+    rownames(mat_diff),
+    colnames(mat_diff),
+    drop = FALSE
+  ]
+
+  sig_mat <- matrix("", nrow = nrow(mat_padj), ncol = ncol(mat_padj))
+  sig_mat[mat_padj < 0.05] <- "*"
+  sig_mat[mat_padj < 0.01] <- "**"
+  sig_mat[mat_padj < 0.001] <- "***"
+
+  if (is.null(lims)) {
+    lims <- max(1, round(max(abs(mat_diff), na.rm = TRUE) * 0.8, 0))
+  }
+  col_fun <- circlize::colorRamp2(
+    seq(-lims, lims, length.out = 100),
+    retro_palette(100)
+  )
+
+  row_ann <- rowAnnotation(
+    `Cell type` = row_info$celltype,
+    col = list(`Cell type` = cell_type_palette_fmc[row_info$celltype]),
+    # Legend only when several cell types share the heatmap
+    show_legend = length(cell_types) > 1,
+    annotation_legend_param = list(`Cell type` = list(at = row_info$celltype)),
+    annotation_name_side = "top",
+    annotation_name_rot = 45,
+    annotation_name_gp = gpar(fontsize = 10)
+  )
+
+  ht <- Heatmap(
+    mat_diff,
+    name = paste0("Difference\n(", contrast_label, ")"),
+    col = col_fun,
+    heatmap_legend_param = list(legend_height = unit(3, "cm")),
+    cluster_rows = FALSE,
+    row_split = if (isTRUE(split_rows)) {
+      factor(row_info$celltype, levels = row_info$celltype)
+    } else {
+      NULL
+    },
+    cluster_row_slices = FALSE,
+    row_title = NULL,
+    row_gap = unit(1.5, "mm"),
+    cluster_columns = cluster_columns,
+    show_column_dend = isTRUE(cluster_columns),
+    row_labels = row_info$row_label,
+    row_names_side = "left",
+    row_names_gp = gpar(fontsize = 10),
+    left_annotation = row_ann,
+    rect_gp = gpar(col = "white", lwd = 1),
+    column_names_gp = gpar(fontsize = 10),
+    column_names_rot = 45,
+    width = ncol(mat_diff) * unit(5, "mm"),
+    height = nrow(mat_diff) * unit(5, "mm"),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      if (sig_mat[i, j] != "") {
+        grid.text(
+          sig_mat[i, j],
+          x,
+          y,
+          vjust = 0.75,
+          gp = gpar(fontsize = 10, col = "black")
+        )
+      }
+    },
+    column_title = paste0(
+      "Differential abundance, pseudobulk\n(",
+      contrast_label,
+      ", batch-adjusted)"
+    ),
+    column_title_gp = gpar(fontsize = 13, fontface = "bold")
+  )
+
+  ht_drawn <- draw(ht, merge_legend = TRUE)
+  drawn_order <- colnames(mat_diff)[ComplexHeatmap::column_order(ht_drawn)]
+
+  if (!is.null(filename)) {
+    dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+    pdf(paste0(filename, ".pdf"), width = width, height = height)
+    draw(ht, merge_legend = TRUE)
+    dev.off()
+    png(
+      paste0(filename, ".png"),
+      width = width,
+      height = height,
+      units = "in",
+      res = png_res
+    )
+    draw(ht, merge_legend = TRUE)
+    dev.off()
+  }
+
+  invisible(list(heatmap = ht, column_order = drawn_order))
+}
+
+pb_heatmap_dir <- here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "5D_pseudobulk_analysis"
+)
+
+# File-name-safe cell type label ("CD8 T FMC63+" -> "CD8_T_FMC63pos")
+celltype_slug <- function(x) {
+  x |>
+    gsub(pattern = "\\+", replacement = "pos") |>
+    gsub(pattern = "-", replacement = "neg") |>
+    gsub(pattern = " ", replacement = "_")
+}
+
+# Shared marker order: FMC63+ is clustered, and FMC63- uses the same column
+# order so the two heatmaps can be compared column by column. Set
+# shared_column_order <- FALSE to cluster each heatmap separately.
+shared_column_order <- TRUE
+pb_heatmap_cell_types <- c("CD8 T FMC63+", "CD8 T FMC63-")
+
+# markers_plot_hm <- unique(unlist(selected_markers[c(3, 4)]))
+# markers_plot_hm <- markers_selected_clr # filtered markers based on clr
+markers_plot_hm <- daa_pseudobulk$results |>
+  filter(celltype %in% c("CD8 T FMC63-", "CD8 T FMC63+")) |>
+  filter(p_adj < 0.05) |>
+  pull(marker) |>
+  unique()
+markers_plot_hm <- intersect(
+  markers_plot_hm,
+  c(selected_markers$`CD8 T FMC63-`, selected_markers$`CD8 T FMC63+`)
+) |>
+  unique()
+
+pb_marker_order <- NULL
+for (ct in pb_heatmap_cell_types) {
+  hm <- plot_pseudobulk_daa_heatmap(
+    daa_pseudobulk$results,
+    markers = markers_plot_hm,
+    cell_types = ct,
+    column_order = if (shared_column_order) pb_marker_order else NULL,
+    filename = file.path(
+      pb_heatmap_dir,
+      paste0("5D_daa_heatmap_pseudobulk_", celltype_slug(ct))
+    )
+  )
+  if (shared_column_order && is.null(pb_marker_order) && !is.null(hm)) {
+    pb_marker_order <- hm$column_order
+  }
+}
+
+# Both CD8 T cell types in one heatmap, as in 5D_daa_heatmap_cell_level
+plot_pseudobulk_daa_heatmap(
+  daa_pseudobulk$results,
+  markers = markers_plot_hm,
+  cell_types = c("CD8 T FMC63+", "CD8 T FMC63-"),
+  filename = file.path(pb_heatmap_dir, "5D_daa_heatmap_pseudobulk_CD8_T"), # Manuscript: Main Figure 5F
+  height = 3
+)
+```
+
+#### Plot results: boxplots
+
+```{r}
+#| label: fig-5-daa-pseudobulk_plot_boxplot
+
+# Per-marker boxplots of the sample-level values behind the pseudobulk test:
+# mean CLR per sample (samples with >= pseudobulk_min_cells cells of that type), t0 vs t1 for
+# each cell type. Points are coloured by donor, and a donor's t0 and t1 samples
+# are joined by a line. Points are the raw per-sample means; the stars come
+# from the batch-adjusted limma test.
+boxplot_cell_types <- c("CD8 T FMC63+", "CD8 T FMC63-")
+boxplot_p_cutoff <- 0.05
+
+pb_res_box <- daa_pseudobulk$results |>
+  filter(celltype %in% boxplot_cell_types)
+
+# Markers to plot. Default: markers in markers_selected that are significant in
+# at least one of the cell types, ordered by the effect in the first cell type.
+# To choose markers by hand, overwrite this, e.g.
+#   boxplot_markers <- c("CD25", "CD39", "CD44", "FMC63")
+boxplot_markers <- pb_res_box |>
+  filter(marker %in% markers_selected) |>
+  summarise(
+    any_sig = any(p_adj < boxplot_p_cutoff),
+    effect_first = difference[celltype == boxplot_cell_types[[1]]][1],
+    .by = marker
+  ) |>
+  filter(any_sig) |>
+  arrange(desc(effect_first)) |>
+  pull(marker)
+
+boxplot_dir <- here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "5D_pseudobulk_analysis",
+  "boxplots_per_marker"
+)
+
+#' Boxplot of per-sample mean CLR for one marker, t0 vs t1 per cell type
+plot_pseudobulk_marker_boxplot <- function(
+  marker_plot,
+  cell_types = boxplot_cell_types,
+  sample_means = daa_pseudobulk$sample_means,
+  results = pb_res_box
+) {
+  plot_data <- sample_means |>
+    filter(marker == marker_plot, celltype %in% cell_types) |>
+    mutate(
+      celltype = factor(celltype, levels = cell_types),
+      timepoint = factor(timepoint, levels = c("t0", "t1")),
+      donor = sub("_t[0-9]+$", "", sample_alias)
+    ) |>
+    # Paired = the donor has a sample at both timepoints for this cell type
+    mutate(paired = n_distinct(timepoint) == 2, .by = c(donor, celltype))
+
+  stars <- results |>
+    filter(marker == marker_plot, celltype %in% cell_types) |>
+    mutate(
+      celltype = factor(celltype, levels = cell_types),
+      label = case_when(
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01 ~ "**",
+        p_adj < 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      y = max(plot_data$mean_clr)
+    )
+
+  ggplot(plot_data, aes(x = timepoint, y = mean_clr)) +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.6,
+      linewidth = 0.3,
+      colour = "grey40"
+    ) +
+    geom_line(
+      data = \(d) filter(d, paired),
+      aes(group = donor, colour = donor),
+      linewidth = 0.5,
+      alpha = 0.8,
+      show.legend = FALSE
+    ) +
+    geom_point(
+      aes(fill = donor),
+      shape = 21,
+      size = 2.5,
+      stroke = 0.25,
+      colour = "black"
+    ) +
+    # Star centred between t0 and t1, above the data
+    geom_text(
+      data = stars,
+      aes(x = 1.5, y = y, label = label),
+      inherit.aes = FALSE,
+      vjust = -0.6,
+      size = 3.5
+    ) +
+    facet_wrap(~celltype, nrow = 1) +
+    scale_fill_manual(values = pal_donor, labels = \(x) gsub("donor", "", x)) +
+    scale_colour_manual(values = pal_donor) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+    labs(
+      x = "Timepoint",
+      y = "Mean CLR per sample",
+      fill = "Donor",
+      title = marker_plot,
+      caption = paste0(
+        "Pseudobulk, >= ",
+        pseudobulk_min_cells,
+        " cells per sample;\nbatch-adjusted limma FDR"
+      )
+    ) +
+    theme_linedraw(base_size = 10) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = NA),
+      strip.text = element_text(colour = "black", face = "bold"),
+      aspect.ratio = 1.5,
+      plot.subtitle = element_text(size = 10),
+      plot.title = element_text(size = 10, face = "bold")
+    )
+}
+
+# File-name-safe marker label (e.g. "HLA-ABC" stays, spaces/slashes become _)
+marker_slug <- function(x) gsub("[^A-Za-z0-9-]", "_", x)
+
+pb_marker_boxplots <- lapply(boxplot_markers, function(m) {
+  p <- plot_pseudobulk_marker_boxplot(m)
+  export_plot(
+    filename = file.path(
+      boxplot_dir,
+      paste0("5D_daa_boxplot_pseudobulk_CD8_T_", marker_slug(m)) # Manuscript: Main Figure 5G (markers: FMC63, CD278, CD38, CD44, CD49D)
+    ),
+    plot = p,
+    width = 4,
+    height = 3.5
+  )
+  p
+})
+names(pb_marker_boxplots) <- boxplot_markers
+
+# Show a few in the report; all are saved to boxplot_dir
+patchwork::wrap_plots(head(pb_marker_boxplots, 4), ncol = 2, guides = "collect")
+```
+
+
+### Per donor (cell-level)
+
+```{r}
+cells_test <- c("CD8 T FMC63+", "CD8 T FMC63-")
+
+n_cell_count <- data_t0t1_b1b2@meta.data |>
+  subset(celltype %in% cells_test) |>
+  group_by(sample_alias, donor, timepoint, celltype) |>
+  summarise(n_cells = n())
+
+donors_exclude <- c("donorD", "donorE", "donorF", "donorG") # only PBMC samples - exclude
+samples_include <- n_cell_count |> # include only donors/samples with at least min_cells_default cells in both FMC63+/- CD8 T cells
+  filter(!donor %in% donors_exclude) |>
+  filter(n_cells >= min_cells_default) |>
+  group_by(sample_alias, timepoint) |>
+  summarize(n = n()) |>
+  filter(n == 2) |>
+  pull(sample_alias) |>
+  unique()
+
+# Not possible to split by donor due to low cell numbers (unless doing pseudobulk)
+daa_res_donor <- RunDAA(
+  data_t0t1_b1b2 |>
+    subset(sample_alias %in% samples_include) |>
+    subset(celltype %in% cells_test),
+  contrast_column = "timepoint",
+  reference = "t0",
+  targets = "t1",
+  group_vars = c("celltype", "donor") # , "donor"
+)
+daa_res_donor$patient <- daa_res_donor$donor
+```
+
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+daa_res_filtered <- daa_res_donor |>
+  filter(marker %in% markers_selected)
+
+# Prepare difference matrix (t1 vs t0)
+mat_diff <- daa_res_filtered |>
+  select(patient, celltype, marker, difference) |>
+  unite("row_id", celltype, patient, sep = " | ") |>
+  pivot_wider(names_from = marker, values_from = difference, values_fill = 0) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+# Prepare p_adj matrix for annotations
+mat_padj <- daa_res_filtered |>
+  select(patient, celltype, marker, p_adj) |>
+  unite("row_id", celltype, patient, sep = " | ") |>
+  pivot_wider(names_from = marker, values_from = p_adj, values_fill = 1) |>
+  column_to_rownames("row_id") |>
+  as.matrix()
+
+# Use if markers should be ordered:
+# marker_order_fig5 <- marker_order_mean_abundance[
+#   marker_order_mean_abundance %in% colnames(mat_diff)
+# ]
+# mat_diff <- mat_diff[, marker_order_fig5, drop = FALSE]
+# mat_padj <- mat_padj[, marker_order_fig5, drop = FALSE]
+
+# Ensure matching dimensions and order
+mat_padj <- mat_padj[rownames(mat_diff), colnames(mat_diff)]
+
+# Create significance matrix
+sig_mat <- matrix("", nrow = nrow(mat_padj), ncol = ncol(mat_padj))
+sig_mat[mat_padj < 0.05] <- "*"
+sig_mat[mat_padj < 0.01] <- "**"
+sig_mat[mat_padj < 0.001] <- "***"
+
+# Define row splits and annotations
+row_meta <- data.frame(row_id = rownames(mat_diff)) |>
+  separate(
+    row_id,
+    into = c("celltype", "patient"),
+    sep = " \\| ",
+    remove = FALSE
+  )
+
+# Colors
+lims <- round(max(abs(mat_diff), na.rm = TRUE) * 0.8, 0)
+col_fun <- circlize::colorRamp2(
+  seq(-lims, lims, length.out = 100),
+  retro_palette(100)
+)
+
+row_ann <- rowAnnotation(
+  `Cell type` = row_meta$celltype,
+  `Patient` = row_meta$patient,
+  col = list(
+    `Cell type` = c("CD8 T FMC63+" = "#40097A", "CD8 T FMC63-" = "#AD5BCD"),
+    `Patient` = pal_donor
+  ),
+  show_legend = TRUE,
+  annotation_name_side = "top",
+  annotation_name_rot = 45,
+  annotation_name_gp = gpar(fontsize = 10)
+)
+
+ht <- Heatmap(
+  mat_diff,
+  name = "Difference\n(t1 vs t0)",
+  col = col_fun,
+  heatmap_legend_param = list(
+    at = seq(-lims, lims, by = 2), # explicit tick marks
+    labels = as.character(seq(-lims, lims, by = 2)),
+    legend_height = unit(4, "cm")
+  ),
+  row_split = factor(
+    row_meta$celltype,
+    levels = c("CD8 T FMC63+", "CD8 T FMC63-")
+  ),
+  cluster_rows = FALSE,
+  cluster_row_slices = FALSE,
+  # cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_dend = TRUE,
+  left_annotation = row_ann,
+  rect_gp = gpar(col = "white", lwd = 1),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  width = ncol(mat_diff) * unit(5, "mm"),
+  height = nrow(mat_diff) * unit(5, "mm"),
+  row_title = NULL,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (sig_mat[i, j] != "") {
+      grid.text(
+        sig_mat[i, j],
+        x,
+        y,
+        vjust = 0.75,
+        gp = gpar(fontsize = 10, col = "black")
+      )
+    }
+  },
+  column_title = "Differential Abundance (t1 vs t0)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold")
+)
+
+draw(ht, merge_legend = TRUE)
+
+pdf(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5D_daa_heatmap_donor_level.pdf"
+  ),
+  width = 12,
+  height = 3
+)
+draw(ht, merge_legend = TRUE)
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "5D_daa_heatmap_donor_level.png"
+  ),
+  width = 12,
+  height = 3,
+  units = "in",
+  res = png_res
+)
+draw(ht, merge_legend = TRUE)
+dev.off()
+```
+
+
+
+# Figure 6
+
+```{r}
+#| label: differential-colocalization
+cells_test <- c("CD8 T FMC63+")
+n_cell_count <- data_t0t1_b1b2@meta.data |>
+  subset(celltype %in% cells_test) |>
+  group_by(sample_alias, donor, timepoint, celltype) |>
+  summarise(n_cells = n())
+
+donors_exclude <- c("donorD", "donorE", "donorF", "donorG") # only PBMC samples or too few cells - exclude
+samples_include <- n_cell_count |> # include only donors/samples with at least min_cells_default CD8 T FMC63+ cells
+  filter(!donor %in% donors_exclude) |>
+  filter(n_cells >= min_cells_default) |>
+  group_by(sample_alias, timepoint) |>
+  pull(sample_alias) |>
+  unique()
+
+col_res <- RunDCA(
+  data_t0t1_b1b2 |>
+    subset(sample_alias %in% samples_include) |>
+    subset(celltype == cells_test),
+  contrast_column = "timepoint",
+  reference = "t0",
+  targets = "t1",
+  group_vars = c("celltype", "donor") # donor
+)
+```
+
+
+## 6A: Colocalization heatmaps
+
+Heatmaps per donor and timepoint showing CD8+ FMC63+ cells
+(only show where n cells > X)
+
+
+```{r}
+data_t0t1_b1b2$component <- NULL
+
+colocscores_dat_t0t1 <- ColocalizationScores(
+  data_t0t1_b1b2,
+  meta_data_columns = c("sample", "donor", "celltype", "timepoint")
+)
+
+colocscores_dat_t0t1$celltype_timepoint <- paste0(
+  colocscores_dat_t0t1$celltype,
+  "_",
+  colocscores_dat_t0t1$timepoint
+)
+
+colocscores_summarized_t0t1 <- SummarizeProximityScores(
+  colocscores_dat_t0t1 |>
+    rename(join_count_z = pearson_z),
+  group_vars = c("sample", "donor", "celltype", "timepoint"),
+  proximity_metric = "join_count_z",
+  summary_stat = "mean",
+  include_missing_obs = T
+) |>
+  rename(mean_pearson_z = mean_join_count_z)
+```
+
+### Differential results (cell-level)
+
+```{r}
+#| label: fig-6-diff-coloc-donors
+
+col_res_donors_top_source <- col_res |>
+  # filter(donor %in% donors_plot) |>
+  filter(marker_1 %in% markers_selected, marker_2 %in% markers_selected) |>
+  group_by(donor, marker_1, marker_2) |>
+  summarise(
+    estimate = mean(estimate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+top_marker_pairs <- col_res_donors_top_source |>
+  group_by(marker_1, marker_2) |>
+  summarise(mean_estimate = mean(estimate, na.rm = TRUE), .groups = "drop") |>
+  slice_max(order_by = abs(mean_estimate), n = 10, with_ties = FALSE)
+
+markers_top <- unique(c(top_marker_pairs$marker_1, top_marker_pairs$marker_2))
+
+col_res_donors_top <- col_res |>
+  # filter(donor %in% donors_plot) |>
+  filter(marker_1 %in% markers_top, marker_2 %in% markers_top) |>
+  group_by(donor, marker_1, marker_2) |>
+  summarise(
+    estimate = mean(estimate, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(size_constant = 1)
+
+p_ref <- ColocalizationHeatmap_custom(
+  col_res_donors_top |> filter(donor == "donorA"),
+  value_col = "estimate",
+  size_col = "size_constant",
+  type = "dots",
+  # symmetrise = FALSE,
+  symmetrise = TRUE,
+  clustering_method = "ward.D2",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  legend_range = c(-5, 5),
+  size_range = c(1, 4.5)
+)
+m_order <- ggplot2::ggplot_build(p_ref)$layout$panel_params[[1]]$x$get_labels()
+
+for (d in col_res_donors_top$donor |> unique()) {
+  message(d)
+  p_donor <- ColocalizationHeatmap_custom(
+    col_res_donors_top |> filter(donor == d),
+    value_col = "estimate",
+    size_col = "size_constant",
+    type = "dots",
+    # symmetrise = FALSE,
+    symmetrise = TRUE,
+    marker_order = m_order,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    legend_range = c(-5, 5),
+    size_range = c(1, 4.5)
+  ) &
+    labs(
+      title = glue::glue("Cell-level diff. comparison ({d})"),
+      x = "",
+      y = "",
+      fill = "Estimate\n(t1 vs t0)"
+    ) &
+    theme(
+      legend.position = "right",
+      axis.text = element_text(size = 8)
+    ) &
+    guides(size = "none")
+
+  export_plot(
+    glue::glue(here(
+      "mpx_2",
+      "results",
+      "b1b2_t0t1",
+      "revised_figs",
+      "6A_diff_coloc_selectedsamples_celllevel_top30_{d}"
+    )),
+    p_donor,
+    width = 4,
+    height = 4
+  )
+}
+```
+
+
+### Differential test (pseudobulk)
+
+#### Run differential analysis
+
+```{r}
+#| label: fig-6-dpa-pseudobulk_test
+
+# Pseudobulk differential colocalization, t1 vs t0 per cell type (unpaired,
+# batch-adjusted limma on per-sample mean pearson_z). See RunPseudobulkDCA()
+# in scripts/R/pseudobulk_limma.R.
+#
+# Filters:
+# - dca_min_cells: minimum cells per sample and cell type (same value as for the
+#   pseudobulk DAA in Fig 5, set in chunk fig-5-daa-pseudobulk)
+# - pseudobulk_min_samples_per_group: minimum samples per group (t0 / t1) for a
+#   cell type to be tested (also set in chunk fig-5-daa-pseudobulk)
+# - dca_min_mean_clr: a marker is only included for a cell type if its mean CLR
+#   is at or above this value in every tested sample of that cell type; pairs are
+#   formed from the markers that pass
+dca_min_cells <- pseudobulk_min_cells
+dca_min_mean_clr <- 0.5
+
+dca_pseudobulk <- RunPseudobulkDCA(
+  data_t0t1_b1b2,
+  contrast_column = "timepoint",
+  reference = "t0",
+  target = "t1",
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  covariate_cols = "batch",
+  min_cells = dca_min_cells,
+  min_mean_clr = dca_min_mean_clr,
+  min_samples_per_group = pseudobulk_min_samples_per_group
+)
+
+# Samples, markers and pairs tested per cell type, and cell types skipped
+dca_pseudobulk$results |>
+  summarise(
+    n_samples_t0 = first(n_samples_reference),
+    n_samples_t1 = first(n_samples_target),
+    n_pairs = n(),
+    n_significant = sum(p_adj < 0.05),
+    .by = celltype
+  ) |>
+  left_join(
+    dca_pseudobulk$markers_tested |> count(celltype, name = "n_markers"),
+    by = "celltype"
+  )
+dca_pseudobulk$skipped
+
+dca_dir <- here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "6A_pseudobulk_analysis"
+)
+dir.create(dca_dir, recursive = TRUE, showWarnings = FALSE)
+
+readr::write_csv(
+  dca_pseudobulk$results,
+  file.path(dca_dir, "6_dca_pseudobulk_t1_vs_t0.csv")
+)
+readr::write_csv(
+  dca_pseudobulk$sample_means,
+  file.path(dca_dir, "6_dca_pseudobulk_t1_vs_t0_sample_means.csv")
+)
+readr::write_csv(
+  dca_pseudobulk$markers_tested,
+  file.path(dca_dir, "6_dca_pseudobulk_t1_vs_t0_markers_tested.csv")
+)
+```
+
+
+#### Plot results: heatmap
+```{r}
+#| label: fig-6-dpa-pseudobulk_plot_heatmap
+hm_limits <- c(-10, 10)
+p_val_lim <- 0.05
+cell_types <- dca_pseudobulk$results$celltype |> unique()
+
+for (cell_type in cell_types) {
+  p <- ColocalizationHeatmap_custom(
+    dca_pseudobulk$results |>
+      filter(celltype == cell_type, p_adj < p_val_lim) |>
+      mutate(size_constant = 1),
+    value_col = "difference",
+    size_col = "size_constant",
+    type = "dots",
+    # symmetrise = FALSE,
+    symmetrise = TRUE,
+    clustering_method = "ward.D2",
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    # legend_range = hm_limits,
+    size_range = c(1, 4.5)
+  ) &
+    labs(
+      title = glue::glue("Pseudobulk DCA for {cell_type}"),
+      x = "",
+      y = "",
+      fill = "Estimate\n(t1 vs t0)",
+      caption = glue::glue(
+        "Significant results shown at an adj. p < {p_val_lim}"
+      )
+    ) &
+    theme(
+      legend.position = "right",
+      axis.text = element_text(size = 8)
+    ) &
+    guides(size = "none")
+  export_plot(
+    glue::glue(here(
+      "mpx_2",
+      "results",
+      "b1b2_t0t1",
+      "revised_figs",
+      "6A_pseudobulk_analysis",
+      "{cell_type}_pseudobulk_diff_coloc_analysis_t1_vs_t0"
+    )),
+    p,
+    width = 5,
+    height = 5
+  )
+}
+```
+
+
+#### Plot results: boxplots
+
+```{r}
+#| label: fig-6-dpa-pseudobulk_plot_boxplots
+
+# Per-pair boxplots of the sample-level values behind the pseudobulk
+# colocalization test: mean pearson_z per sample (samples with >= dca_min_cells cells of
+# that type), t0 vs t1 for each cell type. Points are coloured by donor, and a
+# donor's t0 and t1 samples are joined by a line. Stars come from the
+# batch-adjusted limma test (RunPseudobulkDCA()).
+coloc_boxplot_cell_types <- c("CD8 T FMC63+", "CD8 T FMC63-")
+coloc_boxplot_p_cutoff <- 0.05
+coloc_boxplot_min_abs_effect <- 3
+
+dca_res_box <- dca_pseudobulk$results |>
+  filter(celltype %in% coloc_boxplot_cell_types)
+
+# Pairs to plot. Default: pairs significant in at least one of the cell types,
+# ordered by the effect in the first cell type (largest increase at t1 first).
+# A pair is plotted if it is significant AND at least this large in at least one of the
+# cell types. Set to 0 to use significance only.
+coloc_boxplot_pairs <- dca_res_box |>
+  mutate(
+    passes = p_adj < coloc_boxplot_p_cutoff &
+      abs(difference) >= coloc_boxplot_min_abs_effect
+  ) |>
+  summarise(
+    keep = any(passes),
+    # Effect in the first cell type; NA when the pair was not tested there
+    # (a marker failed the CLR filter in that cell type)
+    effect_first = if (any(celltype == coloc_boxplot_cell_types[[1]])) {
+      difference[celltype == coloc_boxplot_cell_types[[1]]]
+    } else {
+      NA_real_
+    },
+    # Fallback for ordering: the largest effect among the cell types tested
+    effect_any = difference[which.max(abs(difference))],
+    .by = pair
+  ) |>
+  filter(keep) |>
+  # Order by the first cell type's effect, falling back to the other cell type
+  # for pairs not tested in the first, so no pair drops to the end
+  arrange(desc(coalesce(effect_first, effect_any))) |>
+  pull(pair)
+
+coloc_boxplot_pairs <- c(coloc_boxplot_pairs, "CD82__FMC63", "CD8__FMC63") |>
+  unique()
+
+coloc_boxplot_dir <- here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "6A_pseudobulk_analysis",
+  "boxplots_per_pair"
+)
+
+#' Boxplot of per-sample mean pearson_z for one marker pair, t0 vs t1 per cell type
+plot_pseudobulk_pair_boxplot <- function(
+  pair_plot,
+  cell_types = coloc_boxplot_cell_types,
+  sample_means = dca_pseudobulk$sample_means,
+  results = dca_res_box
+) {
+  plot_data <- sample_means |>
+    filter(pair == pair_plot, celltype %in% cell_types) |>
+    mutate(
+      celltype = factor(celltype, levels = cell_types),
+      timepoint = factor(timepoint, levels = c("t0", "t1")),
+      donor = sub("_t[0-9]+$", "", sample_alias)
+    ) |>
+    # Paired = the donor has a sample at both timepoints for this cell type
+    mutate(paired = n_distinct(timepoint) == 2, .by = c(donor, celltype))
+
+  # One label per cell type: the FDR star, or "not tested" when the pair was
+  # not tested in that cell type (a marker failed the CLR filter there)
+  stars <- tibble(celltype = factor(cell_types, levels = cell_types)) |>
+    left_join(
+      results |>
+        filter(pair == pair_plot) |>
+        mutate(celltype = factor(celltype, levels = cell_types)) |>
+        select(celltype, p_adj),
+      by = "celltype"
+    ) |>
+    mutate(
+      label = case_when(
+        is.na(p_adj) ~ "not tested",
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01 ~ "**",
+        p_adj < 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      y = max(plot_data$mean_pearson_z)
+    )
+
+  ggplot(plot_data, aes(x = timepoint, y = mean_pearson_z)) +
+    geom_hline(yintercept = 0, linewidth = 0.25, colour = "grey70") +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.6,
+      linewidth = 0.3,
+      colour = "grey40"
+    ) +
+    geom_line(
+      data = \(d) filter(d, paired),
+      aes(group = donor, colour = donor),
+      linewidth = 0.5,
+      alpha = 0.8,
+      show.legend = FALSE
+    ) +
+    geom_point(
+      aes(fill = donor),
+      shape = 21,
+      size = 2.5,
+      stroke = 0.25,
+      colour = "black"
+    ) +
+    # Label centred between t0 and t1, above the data
+    geom_text(
+      data = stars,
+      aes(x = 1.5, y = y, label = label),
+      inherit.aes = FALSE,
+      vjust = -0.6,
+      size = 3.5
+    ) +
+    facet_wrap(~celltype, nrow = 1, drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_fill_manual(values = pal_donor, labels = \(x) gsub("donor", "", x)) +
+    scale_colour_manual(values = pal_donor) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+    theme_linedraw(base_size = 10) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = NA),
+      strip.text = element_text(colour = "black", face = "bold"),
+      aspect.ratio = 1.5
+    ) +
+    labs(
+      x = "Timepoint",
+      y = "Mean pearson_z per sample",
+      fill = "Donor",
+      title = sub("__", " - ", pair_plot),
+      caption = paste0(
+        "Pseudobulk, >= ",
+        dca_min_cells,
+        " cells per sample; batch-adjusted limma FDR"
+      )
+    )
+}
+
+# File-name-safe pair label
+pair_slug <- function(x) gsub("[^A-Za-z0-9_-]", "_", x)
+
+pb_pair_boxplots <- lapply(coloc_boxplot_pairs, function(pr) {
+  p <- plot_pseudobulk_pair_boxplot(pr)
+  export_plot(
+    filename = file.path(
+      coloc_boxplot_dir,
+      paste0("6_dca_boxplot_pseudobulk_CD8_T_pair_", pair_slug(pr)) # Manuscript: Main Figure 6F (protein pair "pr": CD45-CD82 and CD49D-CD82)
+    ),
+    plot = p,
+    width = 5,
+    height = 4
+  )
+  p
+})
+names(pb_pair_boxplots) <- coloc_boxplot_pairs
+
+# Show a few in the report; all are saved to coloc_boxplot_dir
+patchwork::wrap_plots(head(pb_pair_boxplots, 4), ncol = 2, guides = "collect")
+```
+
+
+
+
+### Raw colocalization heatmaps
+
+#### Per sample
+from PAT:
+
+```{r}
+#| label: colocalization_raw_heatmap_per_cell_type_per_sample
+
+heatmap_grouping_column <- "sample_alias"
+max_heatmap_markers <- 30
+
+# Only CD4/CD8 FMC63+/- cells, in a fixed order
+cell_types <- c("CD4 T FMC63-", "CD4 T FMC63+", "CD8 T FMC63-", "CD8 T FMC63+")
+stopifnot(all(cell_types %in% data_t0t1_b1b2$celltype))
+
+expressed_markers <- unique(unlist(selected_markers[cell_types])) # unique(unlist(markers_to_test))
+grouped_marker_abundance <-
+  FetchData(
+    data_t0t1_b1b2,
+    vars = c("celltype", expressed_markers),
+    layer = "data"
+  ) %>%
+  group_by(celltype) %>%
+  summarise(across(all_of(expressed_markers), \(x) mean(x, na.rm = TRUE))) %>%
+  column_to_rownames("celltype")
+
+# hm_limits <- c(-1, 1)
+hm_limits <- c(-5, 5)
+
+for (cell_type in cell_types) {
+  # Optionally limit markers shown in the heatmap to the top most abundant
+  plot_markers <-
+    grouped_marker_abundance[cell_type, ] %>%
+    unlist() %>%
+    sort(decreasing = TRUE) %>%
+    head(max_heatmap_markers) %>%
+    names()
+
+  pg_data_cell_type <- subset(data_t0t1_b1b2, celltype == cell_type)
+
+  proximity_data <- ColocalizationScores(
+    # ProximityScores
+    pg_data_cell_type,
+    lazy = TRUE,
+    meta_data_columns = c(heatmap_grouping_column)
+  ) |>
+    filter(marker_1 %in% plot_markers) |>
+    filter(marker_2 %in% plot_markers) |>
+    collect()
+
+  summary_proximity_data <- SummarizeProximityScores(
+    proximity_data |> rename(join_count_z = pearson_z),
+    proximity_metric = "join_count_z",
+    group_vars = heatmap_grouping_column
+  )
+  rm(proximity_data)
+  gc()
+
+  # Create reference heatmap to determine marker ordering
+  reference_heatmap <- ColocalizationHeatmap(
+    summary_proximity_data |>
+      group_by(marker_1, marker_2) |>
+      summarise(
+        mean_join_count_z = mean(mean_join_count_z, na.rm = TRUE),
+        pct_detected = mean(pct_detected, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    marker1_col = "marker_1",
+    marker2_col = "marker_2",
+    value_col = "mean_join_count_z",
+    size_col = "pct_detected",
+    type = "dots",
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    legend_range = hm_limits
+  )
+
+  marker_order <- layer_scales(reference_heatmap)$y$range$range
+
+  # Calculate number of markers for dynamic plot sizing
+  n_markers <- length(marker_order)
+
+  # Calculate plot dimensions based on number of markers
+  # Base size + scaling factor to ensure readability across different marker counts
+  # Minimum size ensures small marker sets are still readable, scaling factor accommodates larger sets
+  base_width <- 6
+  base_height <- 6
+  marker_scaling_factor <- 0.15 # Additional inches per marker
+  plot_width <- max(
+    base_width,
+    base_width + (n_markers - 20) * marker_scaling_factor
+  )
+  plot_height <- max(
+    base_height,
+    base_height + (n_markers - 20) * marker_scaling_factor
+  )
+
+  # Cap the color scale to c(-1, 1) for consistent and readable heatmaps
+  global_value_limits <- hm_limits
+
+  # Calculate global size range across all groups for this cell type
+  global_size_range <- range(summary_proximity_data$pct_detected, na.rm = TRUE)
+
+  # Get all unique group values
+  unique_groups <- unique(summary_proximity_data[[heatmap_grouping_column]])
+
+  # Create heatmaps for each group using the reference marker order
+  # Store plots in a list to combine them later
+  group_heatmaps <- list()
+
+  for (group in unique_groups) {
+    # Filter data for current group
+    group_data <-
+      summary_proximity_data |>
+      filter(.data[[heatmap_grouping_column]] == group)
+
+    if (
+      n_distinct(c(
+        group_data$marker_1,
+        group_data$marker_2
+      )) >=
+        2
+    ) {
+      tmp_plot <- ColocalizationHeatmap(
+        group_data,
+        marker1_col = "marker_1",
+        marker2_col = "marker_2",
+        value_col = "mean_join_count_z",
+        size_col = "pct_detected",
+        type = "dots",
+        cluster_cols = FALSE,
+        cluster_rows = FALSE,
+        legend_range = global_value_limits # Use capped range for consistent scaling
+      ) +
+        ggtitle(glue::glue(
+          "Raw colocalization heatmap for {cell_type} in {group}"
+        ))
+
+      # Apply the reference marker order to the ggplot object by modifying the scales
+      # This ensures all heatmaps have consistent marker ordering
+      tmp_plot <- tmp_plot +
+        scale_x_discrete(
+          limits = marker_order,
+          drop = FALSE,
+          position = "top"
+        ) +
+        scale_y_discrete(limits = rev(marker_order), drop = FALSE)
+
+      # Ensure consistent scales across all groups for fair comparison
+      # The legend_range parameter already handles the value scale, but we need to ensure
+      # the size scale is also consistent. Try both fill and color aesthetics in case
+      # ColocalizationHeatmap uses either one
+      plot_layers <- tmp_plot$layers
+      has_fill <- any(sapply(plot_layers, function(l) {
+        "fill" %in% names(l$mapping) || "fill" %in% names(l$aes_params)
+      }))
+      has_color <- any(sapply(plot_layers, function(l) {
+        "colour" %in%
+          names(l$mapping) ||
+          "color" %in% names(l$mapping) ||
+          "colour" %in% names(l$aes_params)
+      }))
+
+      # Apply value scale limits (legend_range should handle this, but ensure it's applied)
+      if (has_fill) {
+        tmp_plot <- tmp_plot +
+          scale_fill_continuous(
+            limits = global_value_limits,
+            oob = scales::oob_squish
+          )
+      }
+      if (has_color && !has_fill) {
+        tmp_plot <- tmp_plot +
+          scale_color_continuous(
+            limits = global_value_limits,
+            oob = scales::oob_squish
+          )
+      }
+
+      # Ensure consistent size scale across all groups
+      tmp_plot <- tmp_plot +
+        scale_size_continuous(limits = global_size_range, range = c(0.5, 5))
+
+      # Save individual plot with dimensions scaled to number of markers
+      export_plot(
+        filename = glue::glue(here::here(
+          "mpx_2",
+          "results",
+          "b1b2_t0t1",
+          "revised_figs",
+          "6A_raw_colocalization_heatmap_per_cell_type/{cell_type}/{group}_{cell_type}_raw_colocalization_heatmap" # Manuscript: Main Figure 6A (cell type: CD8 T FMC63+. Groups: donorA t0, donorA t1, donorC t0, donorC t1)
+        )),
+        plot = tmp_plot,
+        width = plot_width,
+        height = plot_height
+      )
+    } else {
+      # Create an empty plot with a message indicating insufficient markers
+      tmp_plot <- ggplot() +
+        theme_void() +
+        geom_text(aes(
+          0,
+          0,
+          label = glue::glue("Insufficient markers in {cell_type} for {group}")
+        )) +
+        xlim(-1, 1) +
+        ylim(-1, 1)
+    }
+
+    # Store plot for combined visualization
+    group_heatmaps[[group]] <- tmp_plot
+  }
+
+  # Create a combined plot with all groups side by side
+  n_groups <- length(unique_groups)
+  n_rows <- 2
+  n_cols <- ceiling(n_groups / n_rows)
+  combined_plot <- patchwork::wrap_plots(group_heatmaps, nrow = n_rows)
+
+  # Calculate combined plot dimensions: scale width by number of columns, height by number of rows
+  # Each subplot maintains its aspect ratio while accommodating multiple groups
+  combined_width <- plot_width * n_cols
+  combined_height <- plot_height * n_rows
+
+  # Save the combined plot
+  export_plot(
+    filename = glue::glue(here::here(
+      "mpx_2",
+      "results",
+      "b1b2_t0t1",
+      "revised_figs",
+      "6A_raw_colocalization_heatmap_per_cell_type/{cell_type}/{cell_type}_all_{heatmap_grouping_column}_raw_colocalization_heatmap"
+    )),
+    # filename = glue::glue(here::here(
+    #   "results/04_proximity/raw_colocalization_heatmap_per_cell_type/{cell_type}/{cell_type}_all_{heatmap_grouping_column}s_combined_raw_colocalization_heatmap"
+    # )),
+    plot = combined_plot,
+    width = combined_width,
+    height = combined_height
+  )
+}
+```
+
+
+#### Per timepoint
+
+```{r}
+#| label: colocalization_raw_heatmap_per_cell_type_per_timepoint
+
+# Pseudobulk colocalization per cell type and timepoint:
+# mean pearson_z per sample, then averaged across samples per timepoint.
+# - coloc_min_cells: minimum cells per sample and cell type
+# - coloc_min_mean_clr: a marker is kept for a cell type if its mean CLR is
+#   at or above this value in every retained sample of that cell type
+coloc_min_cells <- pseudobulk_min_cells # min_cells_default # for comparison with pseudobulk results, use same min cell cutoff
+coloc_min_mean_clr <- 0.5
+hm_limits <- c(-5, 5)
+
+# Only CD4/CD8 FMC63+/- cells, in a fixed order
+cell_types <- c("CD4 T FMC63-", "CD4 T FMC63+", "CD8 T FMC63-", "CD8 T FMC63+")
+stopifnot(all(cell_types %in% data_t0t1_b1b2$celltype))
+
+coloc_tp_dir <- here::here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "6A_pseudobulk_colocalization_heatmap_per_timepoint"
+)
+dir.create(coloc_tp_dir, recursive = TRUE, showWarnings = FALSE)
+
+pb_clr <- pseudobulk_mean_clr(
+  subset(data_t0t1_b1b2, celltype %in% cell_types),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  min_cells = coloc_min_cells
+)
+pb_clr$excluded # sample x cell type combinations below coloc_min_cells
+
+coloc_markers <- pb_clr$sample_means |>
+  summarise(min_sample_mean_clr = min(mean_clr), .by = c(celltype, marker)) |>
+  filter(min_sample_mean_clr >= coloc_min_mean_clr)
+
+coloc_tp_means <- list()
+coloc_marker_orders <- list() # marker order per cell type, reused in later plots
+for (cell_type in cell_types) {
+  ct_markers <- coloc_markers |> filter(celltype == cell_type) |> pull(marker)
+  ct_samples <- pb_clr$sample_means |>
+    filter(celltype == cell_type) |>
+    distinct(sample_alias, timepoint)
+
+  if (length(ct_markers) < 2 || nrow(ct_samples) == 0) {
+    message(cell_type, ": skipped (fewer than 2 markers or no samples)")
+    next
+  }
+  message(
+    cell_type,
+    ": ",
+    length(ct_markers),
+    " markers, ",
+    nrow(ct_samples),
+    " samples"
+  )
+
+  # Mean pearson_z per sample and pair; pairs missing in a sample become 0
+  sample_coloc <- pseudobulk_mean_coloc(
+    subset(data_t0t1_b1b2, celltype == cell_type),
+    markers = ct_markers,
+    samples = ct_samples$sample_alias,
+    sample_col = "sample_alias",
+    meta_cols = "timepoint"
+  ) |>
+    select(
+      sample_alias,
+      timepoint,
+      marker_1,
+      marker_2,
+      mean_pearson_z,
+      pct_detected
+    ) |>
+    tidyr::complete(
+      tidyr::nesting(sample_alias, timepoint),
+      tidyr::nesting(marker_1, marker_2),
+      fill = list(mean_pearson_z = 0, pct_detected = 0)
+    )
+  gc()
+
+  # Average the sample means per timepoint
+  tp_coloc <- sample_coloc |>
+    summarise(
+      mean_pearson_z = mean(mean_pearson_z),
+      pct_detected = mean(pct_detected),
+      n_samples = n(),
+      .by = c(timepoint, marker_1, marker_2)
+    ) |>
+    mutate(celltype = cell_type)
+  coloc_tp_means[[cell_type]] <- tp_coloc
+
+  # Marker order from clustering the mean across timepoints
+  ref_plot <- ColocalizationHeatmap_custom(
+    tp_coloc |>
+      summarise(
+        mean_pearson_z = mean(mean_pearson_z),
+        pct_detected = mean(pct_detected),
+        .by = c(marker_1, marker_2)
+      ),
+    value_col = "mean_pearson_z",
+    size_col = "pct_detected",
+    type = "dots",
+    clustering_method = "ward.D2",
+    legend_range = hm_limits
+  )
+  marker_order <- ggplot2::ggplot_build(ref_plot)$layout$panel_params[[
+    1
+  ]]$x$get_labels()
+  coloc_marker_orders[[cell_type]] <- marker_order
+
+  # Plot size scaled to the number of markers (as in the per-sample chunk)
+  n_markers <- length(marker_order)
+  plot_size <- max(6, 6 + (n_markers - 20) * 0.15)
+
+  # Shared size scale so dot sizes are comparable across timepoints
+  # size_limits <- range(tp_coloc$pct_detected, na.rm = TRUE)
+  size_limits <- c(0.25, 1) # manually specify size limits
+
+  timepoints <- sort(unique(tp_coloc$timepoint))
+  tp_heatmaps <- list()
+  for (tp in timepoints) {
+    n_samp <- tp_coloc |>
+      filter(timepoint == tp) |>
+      pull(n_samples) |>
+      first()
+    tp_heatmaps[[tp]] <- ColocalizationHeatmap_custom(
+      tp_coloc |> filter(timepoint == tp),
+      value_col = "mean_pearson_z",
+      size_col = "pct_detected",
+      marker_order = marker_order,
+      cluster_rows = FALSE,
+      cluster_cols = FALSE,
+      type = "dots",
+      legend_range = hm_limits,
+      size_range = c(0.5, 4.5)
+    ) &
+      scale_size(range = c(0.5, 4.5), limits = size_limits) &
+      labs(
+        title = glue::glue("{cell_type}, {tp} (n = {n_samp} samples)"),
+        x = "",
+        y = "",
+        fill = "Mean\npearson Z\n(of sample mean)",
+        size = "Mean fraction\ndetected",
+        caption = glue::glue(
+          "Averaged colocalization scores per samples and per timepoint.
+          Only including samples with >= {coloc_min_cells} cells.
+          Markers selected based on abundance CLR >= {coloc_min_mean_clr}."
+        )
+      )
+  }
+
+  p <- patchwork::wrap_plots(tp_heatmaps, nrow = 1)
+
+  export_plot(
+    filename = file.path(
+      coloc_tp_dir,
+      glue::glue("{cell_type}_all_timepoints_pseudobulk_colocalization_heatmap") # Manuscript: Main Figure 6D (cell type: CD8 T FMC63+)
+    ),
+    plot = p,
+    width = plot_size * length(tp_heatmaps),
+    height = plot_size
+  )
+}
+
+coloc_tp_means_bind <- bind_rows(coloc_tp_means)
+readr::write_csv(
+  coloc_tp_means_bind,
+  file.path(coloc_tp_dir, "pseudobulk_colocalization_per_timepoint.csv")
+)
+readr::write_csv(
+  coloc_markers,
+  file.path(coloc_tp_dir, "pseudobulk_colocalization_markers_included.csv")
+)
+```
+
+#### Pseudobulk DCA heatmap in raw heatmap marker order
+
+```{r}
+#| label: fig-6-dpa-pseudobulk_plot_heatmap_raw_order
+
+# Same figure as the pseudobulk DCA heatmap above for CD8 T FMC63+, but with the
+# marker order of the raw colocalization heatmap per timepoint (no clustering)
+ct_ref <- "CD8 T FMC63+"
+p_val_lim <- 0.05
+
+dca_ref <- dca_pseudobulk$results |>
+  filter(celltype == ct_ref, p_adj < p_val_lim) |>
+  mutate(size_constant = 1)
+
+# Raw heatmap order; markers only present in the DCA result are appended
+m_order_ref <- coloc_marker_orders[[ct_ref]]
+dca_markers <- base::union(dca_ref$marker_1, dca_ref$marker_2)
+# All markers of the raw heatmap are kept; markers without significant pairs
+# are drawn as empty rows/columns
+m_order_dca <- m_order_ref # c(m_order_ref, setdiff(dca_markers, m_order_ref))
+
+p <- ColocalizationHeatmap_custom(
+  dca_ref,
+  value_col = "difference",
+  size_col = "size_constant",
+  type = "dots",
+  symmetrise = TRUE,
+  marker_order = m_order_dca,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  size_range = c(1, 4.5)
+) &
+  labs(
+    title = glue::glue("Pseudobulk DCA for {ct_ref}"),
+    x = "",
+    y = "",
+    fill = "Estimate\n(t1 vs t0)",
+    caption = glue::glue(
+      "Significant results shown at an adj. p < {p_val_lim}.
+      Marker order as in the raw colocalization heatmap.
+      Markers without significant pairs are shown empty."
+    )
+  ) &
+  theme(
+    legend.position = "right",
+    axis.text = element_text(size = 8)
+  ) &
+  guides(size = "none") &
+  # Keep all markers (also those without values) on both axes
+  scale_x_discrete(limits = m_order_dca, position = "top", drop = FALSE) &
+  scale_y_discrete(limits = rev(m_order_dca), drop = FALSE)
+p
+
+# Plot size scaled to the number of markers (as in the raw heatmap chunk)
+plot_size <- max(5, 5 + (length(m_order_dca) - 20) * 0.15)
+
+export_plot(
+  glue::glue(here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6A_pseudobulk_analysis",
+    "{ct_ref}_pseudobulk_diff_coloc_analysis_t1_vs_t0_raw_heatmap_order" # Manuscript: Main Figure 6E ("ct_ref": CD8 T FMC63+)
+  )),
+  p,
+  width = plot_size,
+  height = plot_size
+)
+```
+
+
+
+
+## 6B: FMC63 colocalization
+
+Colocalization scores across donors and timepoints together with abundance for selected markers (abundance taken from previous plot?)
+
+To further investigate marker dynamics between pre-infusion (t0) and post-infusion (t1), the raw colocalization scores (mean pearson Z) for FMC63 pairs are shown below. Rows (markers) are clustered to identify modules with similar behavior and annotated with a dynamics category:
+
+- **shared changes**: Colocalization shifts in the same direction (increase or decrease) across all donors, or both donors exhibit the same sign flip (e.g., negative to positive).
+- **donor-specific loss**: Colocalization changes from positive (t0) to negative (t1) in only a subset of donors.
+- **donor-specific gain**: Colocalization changes from negative (t0) to positive (t1) in only a subset of donors.
+- **mostly unchanged**: The magnitude of change between timepoints is minimal ($\Delta Z \le 0.5$) for the majority of donors.
+
+```{r}
+#| label: raw-coloc-scores
+cells_test <- c("CD8 T FMC63+")
+n_cell_count <- data_t0t1_b1b2@meta.data |>
+  subset(celltype %in% cells_test) |>
+  group_by(sample_alias, donor, timepoint, celltype) |>
+  summarise(n_cells = n())
+
+# donors_exclude <- c("donorD", "donorE")
+samples_include <- n_cell_count |> # samples with at least min_cells_default CD8 T FMC63+ cells
+  # filter(!donor %in% donors_exclude) |>
+  # filter(n_cells >= min_cells_default) |>
+  filter(n_cells >= pseudobulk_min_cells) |>
+  group_by(sample_alias, timepoint) |>
+  pull(sample_alias) |>
+  unique()
+
+raw_coloc_fmc63 <- colocscores_summarized_t0t1 |>
+  mutate(sample_alias = paste0(donor, "_", timepoint)) |>
+  filter(celltype == "CD8 T FMC63+") |>
+  # filter(donor != "donor_44") |>
+  filter(sample_alias %in% samples_include) |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63") |>
+  mutate(
+    marker_non_fmc63 = if_else(marker_1 == "FMC63", marker_2, marker_1)
+  ) |>
+  filter(marker_non_fmc63 %in% markers_selected)
+
+if (nrow(raw_coloc_fmc63) == 0) {
+  stop(
+    "No raw FMC63-pair rows found in colocscores_summarized_t0t1 after filtering."
+  )
+}
+
+raw_coloc_plot <- raw_coloc_fmc63 |>
+  select(donor, timepoint, marker_non_fmc63, mean_pearson_z) |>
+  group_by(donor, timepoint, marker_non_fmc63) |>
+  summarise(
+    mean_pearson_z = mean(mean_pearson_z, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Donor order: donors with paired t0/t1 samples first, then t0 only, then t1 only
+# (alphabetical within each group). Based on the samples that pass the cell cutoff.
+donor_levels_raw <- raw_coloc_plot |>
+  distinct(donor, timepoint) |>
+  summarise(
+    pairing = case_when(
+      all(c("t0", "t1") %in% timepoint) ~ "1_paired",
+      "t0" %in% timepoint ~ "2_t0_only",
+      TRUE ~ "3_t1_only"
+    ),
+    .by = donor
+  ) |>
+  arrange(pairing, donor) |>
+  pull(donor)
+timepoint_levels_raw <- c("t0", "t1")
+
+raw_coloc_plot <- raw_coloc_plot |>
+  filter(donor %in% donor_levels_raw, timepoint %in% timepoint_levels_raw) |>
+  mutate(
+    donor = factor(donor, levels = donor_levels_raw),
+    timepoint = factor(timepoint, levels = timepoint_levels_raw),
+    col_id = paste(donor, timepoint, sep = "__")
+  )
+
+mat_raw_coloc <- raw_coloc_plot |>
+  select(marker_non_fmc63, col_id, mean_pearson_z) |>
+  pivot_wider(
+    names_from = col_id,
+    values_from = mean_pearson_z,
+    values_fill = 0
+  ) |>
+  column_to_rownames("marker_non_fmc63") |>
+  as.matrix()
+
+ordered_col_ids_raw <- as.vector(outer(
+  donor_levels_raw,
+  timepoint_levels_raw,
+  paste,
+  sep = "__"
+))
+ordered_col_ids_raw <- ordered_col_ids_raw[
+  ordered_col_ids_raw %in% colnames(mat_raw_coloc)
+]
+mat_raw_coloc <- mat_raw_coloc[, ordered_col_ids_raw, drop = FALSE]
+
+col_meta_raw <- tibble(col_id = colnames(mat_raw_coloc)) |>
+  separate(
+    col_id,
+    into = c("donor", "timepoint"),
+    sep = "__",
+    remove = FALSE
+  ) |>
+  mutate(
+    donor = factor(donor, levels = donor_levels_raw),
+    timepoint = factor(timepoint, levels = timepoint_levels_raw)
+  )
+
+# Gaps between donor slices: small between paired donors, none within the
+# t0-only and t1-only groups, larger between the three groups
+pairing_raw <- col_meta_raw |>
+  summarise(
+    pairing = case_when(
+      n_distinct(timepoint) == 2 ~ "paired",
+      first(timepoint) == "t0" ~ "t0_only",
+      TRUE ~ "t1_only"
+    ),
+    .by = donor
+  )
+slice_pairing <- pairing_raw$pairing[
+  match(levels(droplevels(col_meta_raw$donor)), pairing_raw$donor)
+]
+n_slices <- length(slice_pairing)
+column_gap_mm <- ifelse(
+  slice_pairing[-n_slices] != slice_pairing[-1],
+  5,
+  ifelse(slice_pairing[-1] == "paired", 1, 0)
+)
+
+# Row-level dynamics annotation between t0 and t1 on a per-donor basis
+change_threshold <- 0.5
+row_dynamics <- apply(mat_raw_coloc, 1, function(x) {
+  vals <- setNames(as.numeric(x), colnames(mat_raw_coloc))
+  deltas <- c()
+  n_pairs <- 0
+  n_loss <- 0
+  n_gain <- 0
+
+  for (d in donor_levels_raw) {
+    t0_key <- paste(d, "t0", sep = "__")
+    t1_key <- paste(d, "t1", sep = "__")
+    if (t0_key %in% names(vals) && t1_key %in% names(vals)) {
+      t0_val <- vals[[t0_key]]
+      t1_val <- vals[[t1_key]]
+      deltas <- c(deltas, t1_val - t0_val)
+      n_pairs <- n_pairs + 1
+
+      is_loss <- t0_val > 0 && t1_val < 0
+      is_gain <- t0_val < 0 && t1_val > 0
+      n_loss <- n_loss + as.integer(is_loss)
+      n_gain <- n_gain + as.integer(is_gain)
+    }
+  }
+
+  if (length(deltas) == 0) {
+    return("mostly unchanged")
+  }
+
+  mostly_unchanged <- mean(abs(deltas) <= change_threshold) >= 0.67
+  shared_up <- mean(deltas >= change_threshold) >= 0.67
+  shared_down <- mean(deltas <= -change_threshold) >= 0.67
+
+  shared_loss <- n_pairs > 0 && n_loss == n_pairs
+  shared_gain <- n_pairs > 0 && n_gain == n_pairs
+  donor_specific_loss <- n_loss > 0 && n_loss < n_pairs
+  donor_specific_gain <- n_gain > 0 && n_gain < n_pairs
+
+  # Partial donor sign flips must be labeled donor-specific.
+  if (donor_specific_loss && !donor_specific_gain) {
+    return("donor-specific loss")
+  }
+  if (donor_specific_gain && !donor_specific_loss) {
+    return("donor-specific gain")
+  }
+  if (donor_specific_loss && donor_specific_gain) {
+    return("shared changes")
+  }
+
+  # Shared changes are only assigned when all donors show the same flip behavior,
+  # or when directional changes are shared without sign flips.
+  if (shared_loss || shared_gain) {
+    return("shared changes")
+  }
+  if ((shared_up || shared_down) && n_loss == 0 && n_gain == 0) {
+    return("shared changes")
+  }
+  if (mostly_unchanged) {
+    return("mostly unchanged")
+  }
+  return("mostly unchanged")
+})
+
+row_dyn_df <- data.frame(
+  marker = rownames(mat_raw_coloc),
+  dynamic = factor(
+    row_dynamics,
+    levels = c(
+      "mostly unchanged",
+      "shared changes",
+      "donor-specific loss",
+      "donor-specific gain"
+    )
+  )
+)
+
+row_ann_raw <- rowAnnotation(
+  Pattern = row_dyn_df$dynamic,
+  col = list(
+    Pattern = c(
+      "mostly unchanged" = "#D9D9D9",
+      "shared changes" = "#6BAED6",
+      "donor-specific loss" = "#F46D43",
+      "donor-specific gain" = "#ccd174ff"
+    )
+  ),
+  annotation_name_side = "top"
+)
+
+lims_raw_coloc <- 3
+
+col_fun_raw_coloc <- circlize::colorRamp2(
+  c(-lims_raw_coloc, 0, lims_raw_coloc),
+  c("#233C62", "white", "#931b58")
+)
+
+ht_raw_coloc <- Heatmap(
+  mat_raw_coloc,
+  name = "Mean\npearson Z",
+  col = col_fun_raw_coloc,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_split = col_meta_raw$donor,
+  column_gap = unit(column_gap_mm, "mm"),
+  column_title_rot = 90,
+  show_column_dend = FALSE,
+  column_labels = toupper(as.character(col_meta_raw$timepoint)),
+  row_title = NULL,
+  width = ncol(mat_raw_coloc) * unit(5, "mm") + unit(sum(column_gap_mm), "mm"),
+  height = nrow(mat_raw_coloc) * unit(5, "mm"),
+  left_annotation = row_ann_raw,
+  rect_gp = gpar(col = "white", lwd = 1),
+  heatmap_legend_param = list(
+    legend_height = unit(4, "cm"),
+    at = c(-lims_raw_coloc, 0, lims_raw_coloc),
+    labels = c(-lims_raw_coloc, 0, lims_raw_coloc)
+  )
+)
+
+draw(ht_raw_coloc, merge_legend = TRUE)
+
+pdf(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6B_raw_coloc_heatmap.pdf"
+  ),
+  width = 6,
+  height = 12
+)
+draw(ht_raw_coloc, merge_legend = TRUE)
+dev.off()
+
+png(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6B_raw_coloc_heatmap.png"
+  ),
+  width = 6,
+  height = 12,
+  units = "in",
+  res = png_res
+)
+draw(ht_raw_coloc, merge_legend = TRUE)
+dev.off()
+```
+
+
+```{r}
+#| label: raw-coloc-scores-donorA-donorB
+
+donors_show <- c("donorA", "donorC")
+
+keep_cols <- col_meta_raw$donor %in% donors_show
+mat_sub <- mat_raw_coloc[, keep_cols, drop = FALSE]
+meta_sub <- droplevels(col_meta_raw[keep_cols, ])
+stopifnot(all(donors_show %in% meta_sub$donor))
+
+ht_raw_coloc_ab <- Heatmap(
+  mat_sub,
+  name = "Mean\npearson Z",
+  col = col_fun_raw_coloc,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  # column_split = meta_sub$donor, # split by donor
+  column_split = toupper(as.character(meta_sub$timepoint)), # split by timepoint
+  column_gap = unit(c(2.5), "mm"),
+  column_title_rot = 90,
+  show_column_dend = FALSE,
+  # column_labels = toupper(as.character(meta_sub$timepoint)),
+  column_labels = meta_sub$donor,
+  row_title = NULL,
+  width = ncol(mat_sub) * unit(5, "mm"),
+  height = nrow(mat_sub) * unit(5, "mm"),
+  rect_gp = gpar(col = "white", lwd = 1),
+  heatmap_legend_param = list(
+    legend_height = unit(4, "cm"),
+    at = c(-lims_raw_coloc, 0, lims_raw_coloc),
+    labels = c(-lims_raw_coloc, 0, lims_raw_coloc)
+  )
+)
+
+draw(ht_raw_coloc_ab)
+
+out_stem <- here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "6B_raw_coloc_heatmap_donorA_donorC" # Manuscript: Main Figure 6B (top)
+)
+
+pdf(paste0(out_stem, ".pdf"), width = 4, height = 12)
+draw(ht_raw_coloc_ab)
+dev.off()
+
+png(
+  paste0(out_stem, ".png"),
+  width = 4,
+  height = 12,
+  units = "in",
+  res = png_res
+)
+draw(ht_raw_coloc_ab)
+dev.off()
+```
+
+```{r}
+#| label: raw-coloc-scores-abundance
+
+# Mean CLR per sample for the same markers, samples and order as the coloc heatmap above
+pb_clr_ab <- pseudobulk_mean_clr(
+  subset(data_t0t1_b1b2, celltype == "CD8 T FMC63+" & donor %in% donors_show),
+  group_col = "celltype",
+  sample_col = "sample_alias",
+  contrast_column = "timepoint",
+  covariate_cols = "donor",
+  features = rownames(mat_sub),
+  min_cells = 1 # samples were already selected for the coloc heatmap
+)
+
+# Marker order of the coloc heatmap (read from the drawn heatmap, nothing is shown)
+pdf(NULL)
+marker_order_ab <- rownames(mat_sub)[row_order(draw(ht_raw_coloc_ab))]
+dev.off()
+
+mat_clr <- pb_clr_ab$sample_means |>
+  mutate(col_id = paste(donor, timepoint, sep = "__")) |>
+  select(marker, col_id, mean_clr) |>
+  pivot_wider(names_from = col_id, values_from = mean_clr) |>
+  column_to_rownames("marker") |>
+  as.matrix()
+mat_clr <- mat_clr[marker_order_ab, colnames(mat_sub), drop = FALSE]
+stopifnot(!anyNA(mat_clr))
+
+lims_clr <- c(-5, 5)
+col_fun_clr <- circlize::colorRamp2(
+  seq(lims_clr[1], lims_clr[2], length.out = 100),
+  retro_palette(100)
+)
+
+ht_clr_ab <- Heatmap(
+  mat_clr,
+  name = "Abundance\n(CLR)",
+  col = col_fun_clr,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  # column_split = meta_sub$donor,
+  column_split = toupper(as.character(meta_sub$timepoint)), # split by timepoint
+  column_gap = unit(c(2.5), "mm"),
+  column_title_rot = 90,
+  show_column_dend = FALSE,
+  # column_labels = toupper(as.character(meta_sub$timepoint)),
+  column_labels = meta_sub$donor,
+  row_title = NULL,
+  width = ncol(mat_clr) * unit(5, "mm"),
+  height = nrow(mat_clr) * unit(5, "mm"),
+  rect_gp = gpar(col = "white", lwd = 1),
+  heatmap_legend_param = list(
+    legend_height = unit(4, "cm"),
+    at = c(lims_clr[1], lims_clr[2])
+  )
+)
+
+draw(ht_clr_ab)
+
+out_stem_clr <- here(
+  "mpx_2",
+  "results",
+  "b1b2_t0t1",
+  "revised_figs",
+  "6B_raw_clr_heatmap_donorA_donorC" # Manuscript: Main Figure 6B (bottom)
+)
+
+pdf(paste0(out_stem_clr, ".pdf"), width = 4, height = 12)
+draw(ht_clr_ab)
+dev.off()
+
+png(
+  paste0(out_stem_clr, ".png"),
+  width = 4,
+  height = 12,
+  units = "in",
+  res = png_res
+)
+draw(ht_clr_ab)
+dev.off()
+```
+
+
+## 6C: Selected networks
+
+Network in CD8+FMC63+ T cells
+
+```{r}
+library(ggraph)
+library(igraph)
+
+
+gradient_palette <-
+  c(
+    "#1F395F",
+    "#44628E",
+    "#718BB2",
+    "#A8B9D1",
+    "#DBE1EA",
+    "#F1EEE9",
+    "#F0D7E0",
+    "#E3A6B8",
+    "#CB6E8B",
+    "#A23F5E",
+    "#781534"
+  )
+```
+
+
+Network plots are generated with `PlotColocNetwork()` (`scripts/R/coloc_network.R`). Each call exports an overview figure (`{file_stem}`) and a styled per-donor figure (`{file_stem}_styled`).
+
+```{r}
+#| label: network-scores
+
+# Colocalization scores computed once and reused for both marker sets
+data_t0t1_b1b2$component <- NULL
+network_scores <- ColocalizationScores(
+  data_t0t1_b1b2,
+  meta_data_columns = c("sample_alias", "celltype")
+)
+network_out_dir <- here::here("mpx_2", "results", "b1b2_t0t1", "revised_figs")
+```
+
+### FMC63, CD2, CD8, and CD43
+
+```{r}
+#| label: network-top
+network_top <- PlotColocNetwork(
+  data_t0t1_b1b2,
+  markers = c("CD8", "CD43", "CD2", "FMC63"),
+  cell_type = "CD8 T FMC63+",
+  scores = network_scores,
+  min_pct_detected = 0.5,
+  min_abs_z = 0,
+  gradient_palette = gradient_palette,
+  out_dir = network_out_dir,
+  file_stem = "6C_fmc63_network_top_new" # Manuscript: Main Figure 6C (left)
+)
+```
+
+### FMC63, CD52, HLA-ABC, B2M
+
+```{r}
+#| label: network-bottom
+
+network_bottom <- PlotColocNetwork(
+  data_t0t1_b1b2,
+  markers = c("CD52", "B2M", "HLA-ABC", "FMC63"),
+  cell_type = "CD8 T FMC63+",
+  scores = network_scores,
+  min_pct_detected = 0.5,
+  min_abs_z = 0,
+  gradient_palette = gradient_palette,
+  out_dir = network_out_dir,
+  file_stem = "6C_fmc63_network_bottom" # Manuscript: Main Figure 6C (right)
+)
+```
+
+
+### FMC63, CD3E, CD8, CD43,CD11a,CD18, CD45
+
+```{r}
+#| label: network-cd3
+
+PlotColocNetwork(
+  data_t0t1_b1b2,
+  markers = c("FMC63", "CD3E", "CD8", "CD43", "CD11a", "CD18", "CD45"),
+  cell_type = "CD8 T FMC63+",
+  scores = network_scores,
+  min_pct_detected = 0.5,
+  min_abs_z = 0,
+  gradient_palette = gradient_palette,
+  out_dir = network_out_dir,
+  file_stem = "6C_fmc63_cd3_network",
+  styled_size = c(14, 40),
+  plot_margin = ggplot2::margin(1, 1, 1, 1)
+)
+
+network_cd3 <- PlotColocNetwork(
+  data_t0t1_b1b2,
+  markers = c("CD3E", "CD8", "CD43", "CD11a", "CD18", "CD45"),
+  cell_type = "CD8 T FMC63+",
+  scores = network_scores,
+  min_pct_detected = 0.5,
+  min_abs_z = 0,
+  min_cells = min_cells_default,
+  gradient_palette = gradient_palette,
+  out_dir = network_out_dir,
+  file_stem = "6C_cd3_network",
+  styled_size = c(14, 40),
+  plot_margin = ggplot2::margin(1, 1, 1, 1)
+)
+
+network_cd3_cd11_cd18 <- PlotColocNetwork(
+  data_t0t1_b1b2,
+  markers = c("CD3E", "CD11a", "CD18", "CD8"),
+  cell_type = "CD8 T FMC63+",
+  scores = network_scores,
+  min_pct_detected = 0.5,
+  min_abs_z = 0,
+  min_cells = min_cells_default,
+  gradient_palette = gradient_palette,
+  out_dir = network_out_dir,
+  file_stem = "6C_cd3_cd8_cd11_cd18_network",
+  styled_size = c(14, 40),
+  plot_margin = ggplot2::margin(1, 1, 1, 1)
+)
+```
+
+
+### CD3-centric network
+
+Colocalization of CD3E with a fixed set of partner markers (FMC63, CD8, CD43, CD11a, CD18, CD45) in CD8 T FMC63+ cells. The partner markers are chosen manually and are not filtered on abundance. Edges show the mean pearson Z per sample (donor and timepoint).
+
+
+```{r fig.width=12, fig.height=6}
+#| label: fig6_c_cd3_network
+
+#' CD3E-centred colocalization network of CD8 T FMC63+ cells, one panel per
+#' sample (donor_timepoint). Edges connect CD3E to a fixed, manually chosen set
+#' of partner markers (no abundance filter) and show the mean pearson_z of the
+#' sample, capped at +/-6. All samples are shown (no minimum cell count).
+
+#' Define markers
+marker_focus <- "CD3E"
+net_celltype <- "CD8 T FMC63+"
+custom_limits <- c(-6, 6)
+
+# Same marker set as the per-timepoint network below
+markers_plot <- base::union(
+  marker_focus,
+  c("FMC63", "CD3E", "CD8", "CD43", "CD11a", "CD18", "CD45")
+)
+message(net_celltype, ": ", length(markers_plot), " markers plotted")
+
+net_caption <- glue::glue(
+  "{net_celltype}. Partner markers: fixed selection, not filtered on abundance. \\
+  All samples shown.
+  Edge colour: mean Pearson Z per sample (capped at ±6)."
+)
+
+#' Prepare data
+df_net_cd3 <- colocscores_summarized_t0t1 %>%
+  filter(celltype == "CD8 T FMC63+") |>
+  filter(marker_1 == marker_focus | marker_2 == marker_focus) |>
+  mutate(
+    to = ifelse(marker_1 == marker_focus, marker_2, marker_1),
+    from = ifelse(marker_2 == marker_focus, marker_2, marker_1)
+  ) |>
+  filter(to %in% markers_plot) |>
+  group_by(to) |>
+  # filter(all(abs(mean_pearson_z) > 0.25)) |>
+  ungroup() |>
+  mutate(sample_alias = paste0(donor, "_", timepoint)) |>
+  select(to, from, mean_pearson_z, sample_alias, donor, timepoint)
+
+
+#' Plot graph
+df_net_cd3 <- df_net_cd3 |>
+  mutate(
+    mean_pearson_z_limit = ifelse(
+      mean_pearson_z > custom_limits[2],
+      custom_limits[2],
+      ifelse(
+        mean_pearson_z < custom_limits[1],
+        custom_limits[1],
+        mean_pearson_z
+      )
+    )
+  )
+
+cd3_network_p <- tidygraph::as_tbl_graph(df_net_cd3) %>%
+  ggraph(layout = "graphopt") +
+  geom_edge_link(aes(color = mean_pearson_z_limit), width = 2) +
+  geom_node_label(
+    aes(label = name, filter = name == marker_focus),
+    fontface = "bold",
+    size = 3,
+    fill = "#FEFCDA",
+    label.padding = unit(0.3, "lines")
+  ) +
+  geom_node_text(aes(label = name, filter = name != marker_focus), size = 3) +
+  facet_edges(~sample_alias) +
+  scale_edge_color_gradientn(
+    colours = c("#233C62", "white", "#931b58"),
+    limits = custom_limits
+  ) +
+  labs(
+    title = "CD3E centric network",
+    caption = net_caption
+  ) +
+  coord_fixed(clip = "off") +
+  theme(
+    plot.caption = element_text(size = 8, hjust = 0),
+    # aspect.ratio = 1,
+    strip.background = element_rect(fill = NA),
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.background = element_rect(fill = "white"),
+    panel.spacing = unit(4, "lines"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+  )
+
+cd3_network_p
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6C_cd3_centric_network_per_sample"
+  ),
+  cd3_network_p,
+  width = 8,
+  height = 8
+)
+```
+
+
+Summarized per timepoint
+
+CD3E network per timepoint, averaged across donors with >= 15 CD8 T FMC63+ cells at that timepoint. Same partner markers as above.
+
+```{r}
+#| label: fig6_c_cd3_network_avg_timepoint
+
+#' CD3E-centred colocalization network of CD8 T FMC63+ cells, one network per
+#' timepoint, averaged across donors. Edges connect CD3E to the same fixed set
+#' of partner markers as the per-sample network above (no abundance filter) and
+#' show the mean pearson_z across donors, capped at +/-6. Only donors with
+#' >= net_min_cells cells of this cell type at the timepoint are included.
+#' Partners are averaged over the donors that have a value (n_donors in the
+#' exported table). Node positions are identical in all timepoint panels.
+
+#' Define markers and settings
+marker_focus <- "CD3E"
+net_celltype <- "CD8 T FMC63+"
+net_min_cells <- min_cells_default
+custom_limits <- c(-6, 6)
+
+# Same marker set as the per-sample network above
+markers_plot <- base::union(
+  marker_focus,
+  c("FMC63", "CD3E", "CD8", "CD43", "CD11a", "CD18", "CD45")
+)
+partner_markers <- setdiff(markers_plot, marker_focus)
+
+#' Donors per timepoint with enough cells
+donors_keep <- data_t0t1_b1b2[[]] |>
+  filter(celltype == net_celltype) |>
+  count(donor, timepoint, name = "n_cells") |>
+  mutate(included = n_cells >= net_min_cells)
+excluded_donors <- donors_keep |> filter(!included)
+if (nrow(excluded_donors) > 0) {
+  message(
+    "Excluded (< ",
+    net_min_cells,
+    " cells): ",
+    paste0(
+      excluded_donors$donor,
+      "_",
+      excluded_donors$timepoint,
+      " (",
+      excluded_donors$n_cells,
+      ")",
+      collapse = ", "
+    )
+  )
+}
+donors_keep <- donors_keep |> filter(included)
+
+#' Per-donor edges
+df_cd3_per_donor <- colocscores_summarized_t0t1 |>
+  filter(celltype == net_celltype) |>
+  filter(
+    marker_1 == marker_focus | marker_2 == marker_focus,
+    marker_1 != marker_2
+  ) |>
+  mutate(
+    to = ifelse(marker_1 == marker_focus, marker_2, marker_1),
+    from = marker_focus
+  ) |>
+  filter(to %in% partner_markers) |>
+  semi_join(donors_keep, by = c("donor", "timepoint")) |>
+  select(from, to, donor, timepoint, mean_pearson_z)
+
+#' Average across donors per timepoint
+df_cd3_avg <- df_cd3_per_donor |>
+  summarise(
+    n_donors = n_distinct(donor),
+    mean_z = mean(mean_pearson_z),
+    sd_z = sd(mean_pearson_z),
+    .by = c(timepoint, from, to)
+  ) |>
+  mutate(mean_z_limit = pmin(pmax(mean_z, custom_limits[1]), custom_limits[2]))
+
+n_donors_tp <- donors_keep |> count(timepoint, name = "n_donors")
+
+readr::write_csv(
+  df_cd3_avg,
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6C_cd3_network_averaged_per_timepoint.csv"
+  )
+)
+
+plot_avg_network <- function(edges, title, n_donors) {
+  # Fixed node table (same order in every panel) gives identical star layouts
+  nodes <- tibble::tibble(name = c(marker_focus, partner_markers))
+  graph <- tidygraph::tbl_graph(
+    nodes = nodes,
+    edges = edges |>
+      transmute(
+        from = match(from, nodes$name),
+        to = match(to, nodes$name),
+        mean_z_limit
+      )
+  )
+  ggraph(graph, layout = "star", center = 1) +
+    # Fixed limits keep the panel square (star layout uses a unit circle)
+    expand_limits(x = c(-1.3, 1.3), y = c(-1.3, 1.3)) +
+    geom_edge_link(aes(color = mean_z_limit), width = 3) +
+    geom_node_label(
+      aes(label = name, filter = name == marker_focus),
+      fontface = "bold",
+      size = 4,
+      fill = "#FEFCDA",
+      label.padding = unit(0.2, "lines")
+    ) +
+    geom_node_text(
+      aes(label = name, filter = name != marker_focus),
+      size = 4,
+      repel = FALSE
+    ) +
+    scale_edge_color_gradientn(
+      colours = c("#233C62", "white", "#931b58"),
+      limits = custom_limits,
+      name = "Mean\npearson_z"
+    ) +
+    labs(
+      title = title,
+    ) +
+    coord_fixed(clip = "off") +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 9)
+    )
+}
+
+timepoint_titles <- c(t0 = "Pre-infusion (T0)", t1 = "Post-infusion (T1)")
+tps <- intersect(c("t0", "t1"), unique(df_cd3_avg$timepoint))
+network_tp_plots <- lapply(tps, function(tp) {
+  plot_avg_network(
+    df_cd3_avg |> filter(timepoint == tp),
+    title = paste0(timepoint_titles[[tp]]),
+    n_donors = n_donors_tp$n_donors[n_donors_tp$timepoint == tp]
+  )
+})
+
+avg_caption <- glue::glue(
+  "{marker_focus}-centric network in {net_celltype}; mean pearson Z across donors with >= {net_min_cells} cells at each timepoint \\
+  ({paste0(n_donors_tp$timepoint, ': ', n_donors_tp$n_donors, collapse = ', ')} donors).
+  Partner markers: fixed selection, not filtered on abundance. Edge colour capped at ±6."
+)
+
+p <- patchwork::wrap_plots(network_tp_plots, nrow = 1, guides = "collect") +
+  patchwork::plot_annotation(
+    caption = avg_caption,
+    theme = theme(plot.caption = element_text(size = 7, hjust = 0))
+  )
+p
+
+export_plot(
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6C_cd3_network_avg_per_timepoint" # Manuscript: Main Figure 6G
+  ),
+  p,
+  width = 2.5 * length(network_tp_plots) + 1,
+  height = 4
+)
+```
+
+```{r}
+# Boxplots with selected colocalization scores per donor and timepoint
+p <- ggplot(
+  df_cd3_per_donor |>
+    mutate(
+      timepoint = factor(timepoint, levels = c("t0", "t1")),
+      # Paired = the donor has data at both timepoints
+      paired = n_distinct(timepoint) == 2,
+      .by = c(donor)
+    ),
+  aes(x = timepoint, y = mean_pearson_z)
+) +
+  geom_boxplot() +
+  # ggbeeswarm::geom_beeswarm(
+  #   aes(fill = donor),
+  #   shape = 21,
+  #   size = 2,
+  #   cex = 3,
+  #   color = "black",
+  #   stroke = 0.25,
+  #   dodge.width = 0.15
+  # ) +
+  geom_line(
+    data = \(d) filter(d, paired),
+    aes(group = donor, colour = donor),
+    linewidth = 0.5,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    aes(fill = donor),
+    shape = 21,
+    size = 2.5,
+    stroke = 0.25,
+    colour = "black"
+  ) +
+  facet_wrap(~to) +
+  scale_fill_manual(values = pal_donor, labels = \(x) gsub("donor", "", x)) +
+  scale_colour_manual(values = pal_donor) +
+  # scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = NA),
+    strip.text = element_text(colour = "black", face = "bold"),
+    aspect.ratio = 1.5
+  ) +
+  labs(
+    x = NULL,
+    y = "CD3E colocalization (mean Pearson Z)",
+    title = NULL,
+    fill = "Donor"
+  )
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "6x_cd3_coloc_boxplot"
+  ),
+  plot = p,
+  width = 4,
+  height = 4
+)
+```
+
+
+
+# Supplementary
+
+## S7
+
+```{r}
+#' Plot FMC63 abundance and clustering
+
+# Prepare data
+polscores_dat <- PolarizationScores(
+  data_t0t1_b1b2,
+  meta_data_columns = c(
+    "sample",
+    "sample_alias",
+    "donor",
+    "celltype",
+    "timepoint"
+  )
+)
+polscores_dat$celltype_timepoint <- paste0(
+  polscores_dat$celltype,
+  "_",
+  polscores_dat$timepoint
+)
+
+cts <- data_t0t1_b1b2 %>%
+  JoinLayers() %>%
+  LayerData(layer = "counts") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("marker") %>%
+  tidyr::pivot_longer(-marker, names_to = "component", values_to = "counts")
+
+polscores_dat <- polscores_dat %>%
+  left_join(cts) %>%
+  rename(marker_count = counts)
+
+# Filter data based on counts
+count_cutoff <- 50
+polscores_dat_filt <- polscores_dat %>%
+  rowwise() %>%
+  filter(marker_count > count_cutoff)
+
+# Prepare plot data
+celltypes_plot <- grep(
+  "FMC63\\+",
+  polscores_dat_filt$celltype |> unique(),
+  value = TRUE
+)
+
+pol_scores_plot <- polscores_dat_filt |>
+  filter(celltype %in% celltypes_plot) |>
+  filter(marker_count > 50) |>
+  filter(marker == "FMC63") |>
+  select(
+    morans_z,
+    morans_p_adjusted,
+    timepoint,
+    sample,
+    donor,
+    celltype_timepoint,
+    celltype,
+    marker_count,
+    component
+  ) |>
+  mutate(donor_tp = paste0(donor, "_", timepoint)) |>
+  mutate(
+    timepoint = ifelse(
+      timepoint == "t0",
+      "Pre-infusion (T0)",
+      "Post-infusion (T1)"
+    )
+  ) |>
+  mutate(
+    timepoint = factor(
+      timepoint,
+      levels = c("Pre-infusion (T0)", "Post-infusion (T1)")
+    )
+  )
+
+# Plot
+p <- ggplot(pol_scores_plot, aes(x = donor, y = morans_z)) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.25) +
+  geom_quasirandom(
+    mapping = aes(color = timepoint, fill = timepoint),
+    dodge.width = 0.9,
+    size = .1,
+    width = 0.16
+  ) +
+  stat_summary(
+    aes(group = sample),
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "crossbar",
+    color = "black",
+    width = 0.4,
+    lwd = 0.2,
+    position = position_dodge(width = 0.9)
+  ) +
+  facet_grid(~celltype) +
+  scale_fill_manual(values = pal_time) +
+  scale_color_manual(values = pal_time) +
+  labs(
+    y = "FMC63 polarity score\n(Moran's Z)",
+    x = "",
+    caption = "bar: median value",
+    fill = NULL,
+    color = NULL
+  ) +
+  theme_linedraw() +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", size = 10),
+    axis.text = element_text(color = "black", size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(color = "black", size = 10),
+    legend.position = "bottom",
+    legend.text = element_text(size = 10)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "S7_fmc63_polarity_donor_timepoint_swarm" # Manuscript: Supplementary Figure 7
+  ),
+  plot = p,
+  width = 5,
+  height = 3.5
+)
+```
+
+
+
+
+# Reviewer responses
+
+## 3-2. FMC63 proximity score-driven separation of cells 
+
+Reviewer comment:
+"The analysis of the MPX data is largely limited to averaged pseudo-bulk expression levels. Since the polarization score for each marker, including the CAR, can be calculated at the single-cell level, unsupervised clustering based on these scores could reveal highly informative cellular states. If the current sensitivity of the technology does not support such analyses, the authors should explore computational approaches to maximize the information extracted from the dataset."
+
+
+### Prepare
+
+```{r}
+library(ggrepel)
+library(patchwork)
+```
+
+```{r}
+#' Subset data to work on
+car_data_t0 <- data_t0t1_b1b2 |>
+  subset(celltype == "CD8 T FMC63+" & timepoint == "t0")
+
+car_data_t0t1 <- data_t0t1_b1b2 |>
+  subset(celltype == "CD8 T FMC63+")
+
+car_data_t1 <- data_t0t1_b1b2 |>
+  subset(celltype == "CD8 T FMC63+" & timepoint == "t1")
+
+# Total UMIs (molecules) per cell, for QC strips and variance explained
+car_data_t0$log10_molecules <- log10(car_data_t0$molecules)
+car_data_t0t1$log10_molecules <- log10(car_data_t0t1$molecules)
+car_data_t1$log10_molecules <- log10(car_data_t1$molecules)
+
+pal_batch <- c(batch_1 = "#62d3b1", batch_2 = "#2b866b")
+
+# Strips drawn under the T0+T1 PC line plots (metadata column + palette)
+qc_strips <- list(
+  timepoint = list(col = "timepoint", cols = pal_time),
+  donor = list(col = "donor", cols = pal_donor),
+  batch = list(col = "batch", cols = pal_batch),
+  `log10 UMIs` = list(col = "log10_molecules")
+)
+
+# T0-only plots: every cell is t0, so drop the timepoint strip
+qc_strips_t0 <- qc_strips[c("donor", "batch", "log10 UMIs")]
+
+# T1-only plots: every cell is t1, so drop the timepoint strip
+qc_strips_t1 <- qc_strips_t0
+```
+
+```{r}
+# Markers with mean CLR >= clr_min_mean across all cells in the object
+clr_min_mean <- 0.5
+
+select_clr_markers <- function(obj, min_mean = clr_min_mean) {
+  m <- GetAssayData(obj, assay = "mpxCells", layer = "data")
+  markers <- rownames(m)[Matrix::rowMeans(m) >= min_mean]
+  message(length(markers), " markers with mean CLR >= ", min_mean)
+  markers
+}
+
+clr_markers_t0 <- select_clr_markers(car_data_t0)
+clr_markers_t0t1 <- select_clr_markers(car_data_t0t1)
+clr_markers_t1 <- select_clr_markers(car_data_t1)
+```
+
+```{r}
+tight <- theme(
+  aspect.ratio = 1,
+  plot.margin = margin(1, 1, 1, 1),
+  legend.key.size = unit(0.35, "cm"),
+  legend.margin = margin(0, 0, 0, 0)
+)
+```
+
+```{r}
+#| label: score-helpers
+
+# Build a cells x features score assay from long-format scores
+# (columns: component, feature, value), then return the subsetted object
+make_score_object <- function(obj, scores, assay, min_coverage = 0) {
+  mat <- scores |>
+    pivot_wider(names_from = component, values_from = value) |>
+    column_to_rownames("feature") |>
+    as.matrix()
+
+  # Keep features scored in >= min_coverage of cells, then cells with no NAs;
+  # drop zero-variance features
+  mat <- mat[rowMeans(!is.na(mat)) >= min_coverage, , drop = FALSE]
+  mat <- mat[, colSums(is.na(mat)) == 0, drop = FALSE]
+  mat <- mat[apply(mat, 1, sd) > 0, , drop = FALSE]
+  message(assay, ": ", nrow(mat), " features x ", ncol(mat), " cells")
+
+  out <- subset(obj, cells = colnames(mat))
+  out[[assay]] <- CreateAssayObject(data = mat)
+  DefaultAssay(out) <- assay
+  VariableFeatures(out) <- rownames(mat)
+  out
+}
+
+# Scale, PCA and UMAP on the score assay (reductions: pca_<assay>, umap_<assay>)
+run_score_dr <- function(obj, assay, dims = 1:5) {
+  feats <- rownames(obj[[assay]])
+  obj |>
+    ScaleData() |>
+    RunPCA(
+      features = feats,
+      npcs = min(15, length(feats) - 1),
+      reduction.name = paste0("pca_", assay)
+    ) |>
+    RunUMAP(
+      dims = dims,
+      reduction = paste0("pca_", assay),
+      reduction.name = paste0("umap_", assay)
+    )
+}
+
+# UMAP panels: abundance (CLR) on top, score (diverging, centered at 0) below
+plot_umap_panels <- function(
+  obj,
+  assay,
+  abund_markers,
+  score_feats,
+  score_label
+) {
+  red <- paste0("umap_", assay)
+
+  # Abundance (CLR) lives in the mpxCells assay; FeaturePlot needs the assay key prefix
+  abund <- FeaturePlot(
+    obj,
+    reduction = red,
+    features = paste0(Key(obj[["mpxCells"]]), abund_markers),
+    order = TRUE,
+    combine = FALSE
+  ) |>
+    purrr::map2(abund_markers, \(p, m) {
+      p +
+        scale_color_viridis_c(option = "mako", direction = -1, name = "CLR") +
+        labs(title = paste(m, "abundance"), x = "UMAP 1", y = "UMAP 2") +
+        tight
+    })
+
+  lim <- max(
+    abs(FetchData(obj, vars = score_feats, layer = "data")),
+    na.rm = TRUE
+  )
+  score <- FeaturePlot(
+    obj,
+    reduction = red,
+    features = score_feats,
+    order = TRUE,
+    combine = FALSE
+  ) |>
+    purrr::map2(score_feats, \(p, f) {
+      p +
+        scale_color_gradient2(
+          low = "#2166AC",
+          mid = "grey92",
+          high = "#B2182B",
+          midpoint = 0,
+          limits = c(-lim, lim),
+          name = score_label
+        ) +
+        labs(title = f, x = "UMAP 1", y = "UMAP 2") +
+        tight
+    })
+
+  wrap_plots(abund) / wrap_plots(score)
+}
+
+# Line plot of the top n positive and negative loading features for one PC, with
+# cells ordered by a joint score. highlight: optional feature drawn in black.
+# strips: optional named list of strips drawn under the lines, one per metadata
+# column: list(label = list(col = "<meta column>", cols = <palette or NULL>)).
+# A NULL palette gives a continuous (mako) scale.
+plot_pc_lines <- function(
+  obj,
+  assay,
+  pc,
+  y_lab,
+  noun,
+  n_top = 5,
+  smooth_k = 25, # rolling-mean window (cells); set to 1 for raw per-cell values
+  highlight = NULL,
+  strips = NULL
+) {
+  mat <- as.matrix(GetAssayData(obj, assay = assay, layer = "data"))
+  load <- Loadings(obj, reduction = paste0("pca_", assay))[, pc]
+  pc_label <- paste0("PC", pc)
+
+  pos <- names(sort(load, decreasing = TRUE))[seq_len(n_top)]
+  neg <- names(sort(load))[seq_len(n_top)]
+  draw <- unique(c(pos, neg, highlight))
+
+  # Joint score per cell, so cells are ordered along this PC's axis
+  joint <- colMeans(mat[pos, , drop = FALSE]) -
+    colMeans(mat[neg, , drop = FALSE])
+  cell_order <- names(sort(joint))
+
+  line_data <- mat[draw, cell_order, drop = FALSE] |>
+    t() |>
+    as.data.frame() |>
+    mutate(cell_rank = row_number()) |>
+    pivot_longer(-cell_rank, names_to = "feature", values_to = "score") |>
+    mutate(feature = factor(feature, levels = draw)) |>
+    group_by(feature) |>
+    mutate(
+      score = as.numeric(
+        stats::filter(score, rep(1 / smooth_k, smooth_k), sides = 2)
+      )
+    ) |>
+    ungroup() |>
+    filter(!is.na(score))
+
+  label_data <- slice_max(line_data, cell_rank, by = feature)
+  right_margin <- max(nchar(as.character(label_data$feature))) * 4.5 + 30 # pt
+  n_cells <- max(line_data$cell_rank)
+
+  cols <- c(
+    setNames(colorRampPalette(c("#B2182B", "#F4A582"))(n_top), pos),
+    setNames(colorRampPalette(c("#92C5DE", "#2166AC"))(n_top), neg)
+  )
+  if (!is.null(highlight)) {
+    cols[highlight] <- "black"
+  }
+
+  p <- ggplot(line_data, aes(cell_rank, score, color = feature)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+    geom_line(linewidth = 0.5) +
+    geom_text_repel(
+      data = label_data,
+      aes(label = feature),
+      direction = "y",
+      hjust = 0,
+      nudge_x = n_cells * 0.04, # fixed gap right of the line ends
+      xlim = c((n_cells * 1.01) + 5, Inf), # labels can never go left of the data
+      segment.size = 0.3,
+      segment.color = "grey50",
+      min.segment.length = 0,
+      size = 3,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = cols, guide = "none") +
+    coord_cartesian(xlim = c(0, n_cells), clip = "off") +
+    labs(
+      x = paste0("Cells ordered by joint ", pc_label, " score"),
+      y = y_lab,
+      title = paste0("Top ", pc_label, "-separating ", noun)
+    ) +
+    theme_classic() +
+    theme(plot.margin = margin(5, right_margin, 5, 5))
+
+  if (is.null(strips)) {
+    return(p + theme(legend.position = "none"))
+  }
+
+  # One thin strip per metadata column, stacked under the lines in cell order
+  strip_plots <- purrr::imap(strips, \(s, lab) {
+    d <- tibble(
+      cell_rank = seq_along(cell_order),
+      value = obj@meta.data[cell_order, s$col]
+    )
+    ggplot(d, aes(cell_rank, 1, fill = value)) +
+      geom_raster() +
+      (if (is.null(s$cols)) {
+        scale_fill_viridis_c(option = "mako", direction = -1, name = lab)
+      } else {
+        scale_fill_manual(values = s$cols, name = lab)
+      }) +
+      scale_x_continuous(expand = c(0, 0)) +
+      coord_cartesian(xlim = c(0, n_cells), clip = "off") +
+      labs(y = lab) +
+      theme_void() +
+      theme(
+        axis.title.y = element_text(
+          size = 8,
+          angle = 0,
+          hjust = 1,
+          margin = margin(r = 4)
+        ),
+        plot.margin = margin(0, right_margin, 0, 5),
+        legend.position = "bottom"
+      )
+  })
+
+  # The x axis moves to the bottom strip
+  p <- p +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.position = "none"
+    )
+  last <- length(strip_plots)
+  strip_plots[[last]] <- strip_plots[[last]] +
+    labs(x = paste0("Cells ordered by joint ", pc_label, " score")) +
+    theme(axis.title.x = element_text(size = 9))
+
+  wrap_plots(
+    c(list(p), strip_plots),
+    ncol = 1,
+    heights = c(1, rep(0.07, last)),
+    guides = "collect"
+  ) &
+    theme(legend.position = "bottom")
+}
+
+# Legends only for the strips under the PC line plots
+plot_strip_legends <- function(obj, strips) {
+  legends <- purrr::imap(strips, \(s, lab) {
+    d <- tibble(value = obj@meta.data[[s$col]])
+    p <- ggplot(d, aes(1, 1, fill = value)) +
+      geom_raster() +
+      (if (is.null(s$cols)) {
+        scale_fill_viridis_c(option = "mako", direction = -1, name = lab)
+      } else {
+        scale_fill_manual(values = s$cols, name = lab)
+      }) +
+      theme_void() +
+      theme(legend.position = "bottom")
+    cowplot::get_plot_component(p, "guide-box-bottom")
+  })
+  cowplot::plot_grid(plotlist = legends, nrow = 1)
+}
+
+# Variance in the first n_pcs PCs explained by technical and biological covariates
+# (R2 per PC, plus a PC-variance-weighted overall value).
+# - Marginal R2 on all cells: timepoint, donor, batch, log10 UMIs
+# - Timepoint | donor: timepoint effect within donor, on donors with >= min_cells
+#   cells at every timepoint (0 = any donor present at all timepoints)
+# - Donor | batch: donor variation within batch (batch is nested in donor here)
+pc_variance_explained <- function(obj, assay, n_pcs = 6, min_cells = 0) {
+  red <- paste0("pca_", assay)
+  emb <- Embeddings(obj, red)[, seq_len(n_pcs), drop = FALSE]
+  md <- obj@meta.data[
+    rownames(emb),
+    c("timepoint", "donor", "batch", "log10_molecules")
+  ]
+  pc_var <- Stdev(obj, red)[seq_len(n_pcs)]^2
+
+  multi_tp <- n_distinct(md$timepoint) > 1
+
+  if (multi_tp) {
+    paired <- md |>
+      count(donor, timepoint) |>
+      filter(n >= min_cells) |>
+      count(donor) |>
+      filter(n == n_distinct(md$timepoint)) |>
+      pull(donor)
+    message(
+      "Paired donors (>= ",
+      min_cells,
+      " cells per timepoint): ",
+      paste(paired, collapse = ", ")
+    )
+    paired_idx <- md$donor %in% paired
+  }
+
+  r2 <- \(y, f, rows = TRUE) {
+    summary(lm(f, data = cbind(y = y, md)[rows, ]))$r.squared
+  }
+
+  per_pc <- purrr::map_dfr(seq_len(n_pcs), \(i) {
+    y <- emb[, i]
+    r2_donor <- r2(y, y ~ donor)
+    out <- tibble(
+      PC = paste0("PC", i),
+      var = pc_var[i],
+      Donor = r2_donor,
+      Batch = r2(y, y ~ batch),
+      `log10 UMIs` = r2(y, y ~ log10_molecules),
+      `Donor | batch` = r2_donor - r2(y, y ~ batch)
+    )
+    if (multi_tp) {
+      out$Timepoint <- r2(y, y ~ timepoint)
+      out$`Timepoint | donor` <- r2(y, y ~ donor + timepoint, paired_idx) -
+        r2(y, y ~ donor, paired_idx)
+    }
+    out
+  })
+
+  list(
+    per_pc = per_pc,
+    overall = per_pc |>
+      summarise(across(-c(PC, var), \(x) weighted.mean(x, var)))
+  )
+}
+
+plot_variance_explained <- function(res, title) {
+  res$per_pc |>
+    pivot_longer(-c(PC, var), names_to = "source", values_to = "r2") |>
+    mutate(
+      source = factor(
+        source,
+        levels = intersect(
+          c(
+            "Timepoint",
+            "Donor",
+            "Batch",
+            "log10 UMIs",
+            "Timepoint | donor",
+            "Donor | batch"
+          ),
+          unique(source)
+        )
+      )
+    ) |>
+    ggplot(aes(PC, r2, fill = source)) +
+    geom_col(position = position_dodge(width = 0.85), width = 0.8) +
+    scale_fill_manual(
+      values = c(
+        "Timepoint" = "#E6AB02",
+        "Donor" = "grey60",
+        "Batch" = "#1B9E77",
+        "log10 UMIs" = "#E7298A",
+        "Timepoint | donor" = "#7570B3",
+        "Donor | batch" = "grey35"
+      )
+    ) +
+    labs(x = NULL, y = "R² of PC score", fill = NULL, title = title) +
+    theme_classic()
+}
+```
+
+### T0: Polarization-based
+```{r}
+car_pol_t0 <- PolarizationScores(car_data_t0) |>
+  filter(marker %in% clr_markers_t0) |>
+  select(component, feature = marker, value = morans_z) |>
+  make_score_object(car_data_t0, scores = _, assay = "polarization") |>
+  run_score_dr("polarization")
+
+DimPlot(car_pol_t0, group.by = "donor", reduction = "umap_polarization") +
+  theme_classic() +
+  scale_color_manual(values = pal_donor) +
+  labs(
+    title = "UMAP of FMC63+ CD8 T cells (t0)\nbased on polarization scores"
+  ) &
+  theme(aspect.ratio = 1)
+
+p_dimhm <- DimHeatmap(
+  car_pol_t0,
+  reduction = "pca_polarization",
+  dims = 1:6,
+  fast = FALSE
+)
+p_dimhm
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_polarization_dim_hm"
+  ),
+  plot = p_dimhm,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+abund_markers <- c("FMC63", "CD3E", "CD45")
+
+p <- plot_umap_panels(
+  car_pol_t0,
+  assay = "polarization",
+  abund_markers = abund_markers,
+  score_feats = abund_markers,
+  score_label = "Moran's Z"
+)
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_polarization_umap"
+  ),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+tp_pol_t0 <- pc_variance_explained(car_pol_t0, "polarization")
+tp_pol_t0$overall
+
+p_tp_pol_t0 <- plot_variance_explained(
+  tp_pol_t0,
+  "Variance explained in polarization PCs (t0)"
+)
+p_tp_pol_t0
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_polarization_pc_variance_explained"
+  ),
+  plot = p_tp_pol_t0,
+  width = 7,
+  height = 4
+)
+```
+
+```{r}
+# Line plots for the top PCs; FMC63 highlighted in black
+# (must pass the CLR filter and have non-zero variance)
+stopifnot("FMC63" %in% rownames(car_pol_t0[["polarization"]]))
+
+p_pol_line_grid <- purrr::map(
+  1:6,
+  \(pc) {
+    plot_pc_lines(
+      car_pol_t0,
+      assay = "polarization",
+      pc = pc,
+      y_lab = "Polarization score (Moran's Z)",
+      noun = "polarization markers",
+      highlight = "FMC63",
+      strips = qc_strips_t0
+    )
+  }
+) |>
+  wrap_plots(ncol = 2) &
+  theme(legend.position = "none")
+p_pol_line_grid
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_polarization_pc1-6_top_markers_lineplot"
+  ),
+  plot = p_pol_line_grid & theme(legend.position = "none"),
+  width = 14,
+  height = 10
+)
+```
+
+
+### T0: Colocalization-based 
+
+```{r}
+# Pairs where both markers pass the CLR filter; pairs scored in >= 80% of cells
+car_col_t0 <- ColocalizationScores(car_data_t0) |>
+  filter(marker_1 %in% clr_markers_t0, marker_2 %in% clr_markers_t0) |>
+  filter(marker_1 != marker_2) |>
+  mutate(feature = paste(marker_1, marker_2, sep = ":")) |>
+  select(component, feature, value = pearson_z) |>
+  make_score_object(
+    car_data_t0,
+    scores = _,
+    assay = "colocalization",
+    min_coverage = 0.8
+  ) |>
+  run_score_dr("colocalization", dims = 1:6)
+
+ElbowPlot(car_col_t0, reduction = "pca_colocalization")
+
+DimPlot(car_col_t0, group.by = "donor", reduction = "umap_colocalization") +
+  theme_classic() +
+  scale_color_manual(values = pal_donor) +
+  labs(
+    title = "UMAP of FMC63+ CD8 T cells (t0)\nbased on colocalization scores"
+  ) &
+  theme(aspect.ratio = 1)
+
+p_dimhm <- DimHeatmap(
+  car_col_t0,
+  reduction = "pca_colocalization",
+  dims = 1:6,
+  fast = FALSE
+)
+p_dimhm
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_dim_hm"
+  ),
+  plot = p_dimhm,
+  width = 14,
+  height = 8
+)
+```
+
+```{r}
+p <- plot_umap_panels(
+  car_col_t0,
+  assay = "colocalization",
+  abund_markers = c("FMC63", "CD50", "CD45"),
+  score_feats = c("CD50:FMC63", "CD45:FMC63", "CD45:CD50"),
+  score_label = "Pearson Z"
+)
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_umap"
+  ),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+tp_col_t0 <- pc_variance_explained(car_col_t0, "colocalization")
+tp_col_t0$overall
+
+p_tp_col_t0 <- plot_variance_explained(
+  tp_col_t0,
+  "Variance explained in colocalization PCs (t0)"
+)
+p_tp_col_t0
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_pc_variance_explained"
+  ),
+  plot = p_tp_col_t0,
+  width = 7,
+  height = 4
+)
+```
+
+```{r}
+# Line plots for the top PCs
+p_col_line_grid <- purrr::map(
+  1:6,
+  \(pc) {
+    plot_pc_lines(
+      car_col_t0,
+      assay = "colocalization",
+      pc = pc,
+      y_lab = "Colocalization score (Pearson Z)",
+      noun = "colocalization pairs",
+      strips = qc_strips_t0
+    )
+  }
+) |>
+  wrap_plots(ncol = 2) &
+  theme(legend.position = "none")
+p_col_line_grid
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_pc1-6_top_pairs_lineplot"
+  ),
+  plot = p_col_line_grid,
+  width = 14,
+  height = 10
+)
+```
+
+
+### T0: Colocalization-based (FMC63 pairs only) 
+
+```{r}
+# Pairs with FMC63 where both markers pass the CLR filter; pairs scored in >= 80% of cells
+car_col_fmc_t0 <- ColocalizationScores(car_data_t0) |>
+  filter(marker_1 %in% clr_markers_t0, marker_2 %in% clr_markers_t0) |>
+  filter(marker_1 != marker_2) |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63") |> # only pairs involving FMC63
+  mutate(feature = paste(marker_1, marker_2, sep = ":")) |>
+  select(component, feature, value = pearson_z) |>
+  make_score_object(
+    car_data_t0,
+    scores = _,
+    assay = "colocalization",
+    min_coverage = 0.8
+  ) |>
+  run_score_dr("colocalization", dims = 1:6)
+
+ElbowPlot(car_col_fmc_t0, reduction = "pca_colocalization")
+
+DimPlot(car_col_fmc_t0, group.by = "donor", reduction = "umap_colocalization") +
+  theme_classic() +
+  scale_color_manual(values = pal_donor) +
+  labs(
+    title = "UMAP of FMC63+ CD8 T cells (t0, FMC63 pairs)\nbased on colocalization scores"
+  ) &
+  theme(aspect.ratio = 1)
+
+p_dimhm <- DimHeatmap(
+  car_col_fmc_t0,
+  reduction = "pca_colocalization",
+  dims = 1:6,
+  fast = FALSE
+)
+p_dimhm
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_fmc63_dim_hm"
+  ),
+  plot = p_dimhm,
+  width = 14,
+  height = 8
+)
+```
+
+```{r}
+p <- plot_umap_panels(
+  car_col_fmc_t0,
+  assay = "colocalization",
+  abund_markers = c("CD82", "CD54", "CD45"),
+  score_feats = c("CD82:FMC63", "CD54:FMC63", "CD45:FMC63"),
+  score_label = "Pearson Z"
+)
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_fmc63_umap"
+  ),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+tp_col_fmc_t0 <- pc_variance_explained(car_col_fmc_t0, "colocalization")
+tp_col_fmc_t0$overall
+
+p_tp_col_fmc_t0 <- plot_variance_explained(
+  tp_col_fmc_t0,
+  "Variance explained in colocalization PCs (t0, FMC63 pairs)"
+)
+p_tp_col_fmc_t0
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_fmc63_pc_variance_explained"
+  ),
+  plot = p_tp_col_fmc_t0,
+  width = 7,
+  height = 4
+)
+```
+
+```{r}
+# Line plots for the top PCs
+p_col_line_grid <- purrr::map(
+  1:6,
+  \(pc) {
+    plot_pc_lines(
+      car_col_fmc_t0,
+      assay = "colocalization",
+      pc = pc,
+      y_lab = "Colocalization score (Pearson Z)",
+      noun = "colocalization pairs",
+      strips = qc_strips_t0
+    )
+  }
+) |>
+  wrap_plots(ncol = 2) &
+  theme(legend.position = "none")
+p_col_line_grid
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_fmc63_pc1-6_top_pairs_lineplot"
+  ),
+  plot = p_col_line_grid,
+  width = 14,
+  height = 10
+)
+```
+
+```{r}
+# Number of cells per sample used in the FMC63-pair colocalization analysis
+# (cells with a complete set of scores that remain after filtering) next to
+# the number of FMC63+ CD8 T cells available at t0
+cells_per_sample_fmc_t0 <- car_col_fmc_t0@meta.data |>
+  count(sample_alias, donor, timepoint, batch, name = "n_cells_used") |>
+  left_join(
+    car_data_t0@meta.data |>
+      count(sample_alias, name = "n_cells_available"),
+    by = "sample_alias"
+  ) |>
+  mutate(n_cells_dropped = n_cells_available - n_cells_used) |>
+  arrange(donor)
+cells_per_sample_fmc_t0
+
+readr::write_csv(
+  cells_per_sample_fmc_t0,
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_colocalization_fmc63_cells_per_sample.csv"
+  )
+)
+```
+
+
+### T0+T1: Polarization-based
+
+```{r}
+car_pol_t0t1 <- PolarizationScores(car_data_t0t1) |>
+  filter(marker %in% clr_markers_t0t1) |>
+  select(component, feature = marker, value = morans_z) |>
+  make_score_object(car_data_t0t1, scores = _, assay = "polarization") |>
+  run_score_dr("polarization")
+
+# Same UMAP colored by donor and by timepoint
+p_umap_group <- (DimPlot(
+  car_pol_t0t1,
+  group.by = "donor",
+  reduction = "umap_polarization"
+) +
+  scale_color_manual(values = pal_donor) |
+  DimPlot(
+    car_pol_t0t1,
+    group.by = "timepoint",
+    reduction = "umap_polarization"
+  ) +
+    scale_color_manual(values = pal_time)) &
+  theme_classic() &
+  labs(title = NULL) &
+  theme(aspect.ratio = 1)
+p_umap_group +
+  plot_annotation(
+    title = "UMAP of FMC63+ CD8 T cells (t0 + t1)\nbased on polarization scores"
+  )
+
+p_dimhm <- DimHeatmap(
+  car_pol_t0t1,
+  reduction = "pca_polarization",
+  dims = 1:6,
+  fast = FALSE
+)
+p_dimhm
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_polarization_dim_hm"
+  ),
+  plot = p_dimhm,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+abund_markers <- c("FMC63", "CD3E", "CD45")
+
+p <- plot_umap_panels(
+  car_pol_t0t1,
+  assay = "polarization",
+  abund_markers = abund_markers,
+  score_feats = abund_markers,
+  score_label = "Moran's Z"
+)
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_polarization_umap"
+  ),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+# How much of the PC variation is explained by timepoint, donor, batch and UMIs?
+tp_pol <- pc_variance_explained(car_pol_t0t1, "polarization")
+tp_pol$overall
+
+p_tp_pol <- plot_variance_explained(
+  tp_pol,
+  "Variance explained in polarization PCs"
+)
+p_tp_pol
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_polarization_pc_variance_explained"
+  ),
+  plot = p_tp_pol,
+  width = 9,
+  height = 4
+)
+```
+
+```{r}
+# Line plots for the top PCs with QC strips; FMC63 highlighted in black
+stopifnot("FMC63" %in% rownames(car_pol_t0t1[["polarization"]]))
+
+p_pol_line_grid <- purrr::map(
+  1:6,
+  \(pc) {
+    plot_pc_lines(
+      car_pol_t0t1,
+      assay = "polarization",
+      pc = pc,
+      y_lab = "Polarization score (Moran's Z)",
+      noun = "polarization markers",
+      highlight = "FMC63",
+      strips = qc_strips
+    )
+  }
+) |>
+  wrap_plots(ncol = 2, guides = "collect") &
+  theme(legend.position = "none")
+p_pol_line_grid
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_polarization_pc1-6_top_markers_lineplot"
+  ),
+  plot = p_pol_line_grid & theme(legend.position = "none"),
+  width = 14,
+  height = 10
+)
+```
+
+
+### T0+T1: Colocalization-based
+
+```{r}
+# Pairs where both markers pass the CLR filter; pairs scored in >= 80% of cells
+car_col_t0t1 <- ColocalizationScores(car_data_t0t1) |>
+  filter(marker_1 %in% clr_markers_t0t1, marker_2 %in% clr_markers_t0t1) |>
+  filter(marker_1 != marker_2) |>
+  mutate(feature = paste(marker_1, marker_2, sep = ":")) |>
+  select(component, feature, value = pearson_z) |>
+  make_score_object(
+    car_data_t0t1,
+    scores = _,
+    assay = "colocalization",
+    min_coverage = 0.8
+  ) |>
+  run_score_dr("colocalization")
+
+ElbowPlot(car_col_t0t1, reduction = "pca_colocalization")
+
+# Same UMAP colored by donor and by timepoint
+p_umap_group <- (DimPlot(
+  car_col_t0t1,
+  group.by = "donor",
+  reduction = "umap_colocalization"
+) +
+  scale_color_manual(values = pal_donor) |
+  DimPlot(
+    car_col_t0t1,
+    group.by = "timepoint",
+    reduction = "umap_colocalization"
+  ) +
+    scale_color_manual(values = pal_time)) &
+  theme_classic() &
+  labs(title = NULL) &
+  theme(aspect.ratio = 1)
+p_umap_group +
+  plot_annotation(
+    title = "UMAP of FMC63+ CD8 T cells (t0 + t1)\nbased on colocalization scores"
+  )
+
+p_dimhm <- DimHeatmap(
+  car_col_t0t1,
+  reduction = "pca_colocalization",
+  dims = 1:6,
+  fast = FALSE
+)
+p_dimhm
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_colocalization_dim_hm"
+  ),
+  plot = p_dimhm,
+  width = 14,
+  height = 8
+)
+```
+
+```{r}
+p <- plot_umap_panels(
+  car_col_t0t1,
+  assay = "colocalization",
+  abund_markers = c("FMC63", "CD50", "CD45"),
+  score_feats = c("CD50:FMC63", "CD45:FMC63", "CD45:CD50"),
+  score_label = "Pearson Z"
+)
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_colocalization_umap"
+  ),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+# How much of the PC variation is explained by timepoint, donor, batch and UMIs?
+tp_col <- pc_variance_explained(car_col_t0t1, "colocalization")
+tp_col$overall
+
+p_tp_col <- plot_variance_explained(
+  tp_col,
+  "Variance explained in colocalization PCs"
+)
+p_tp_col
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_colocalization_pc_variance_explained"
+  ),
+  plot = p_tp_col,
+  width = 9,
+  height = 4
+)
+```
+
+```{r}
+# Line plots for the top PCs with QC strips
+p_col_line_grid <- purrr::map(
+  1:6,
+  \(pc) {
+    plot_pc_lines(
+      car_col_t0t1,
+      assay = "colocalization",
+      pc = pc,
+      y_lab = "Colocalization score (Pearson Z)",
+      noun = "colocalization pairs",
+      strips = qc_strips
+    )
+  }
+) |>
+  wrap_plots(ncol = 2, guides = "collect") &
+  theme(legend.position = "none")
+
+p_col_line_grid
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_colocalization_pc1-6_top_pairs_lineplot"
+  ),
+  plot = p_col_line_grid,
+  width = 14,
+  height = 10
+)
+```
+
+### Legends for the PC line plot strips
+
+```{r}
+# Legends for the strips under the PC line plots (the line plot exports have no
+# legends). Built from the full t0+t1 object so every donor is listed.
+p_strip_legends_t0 <- plot_strip_legends(car_data_t0t1, qc_strips_t0)
+p_strip_legends_t0t1 <- plot_strip_legends(car_data_t0t1, qc_strips)
+p_strip_legends_t0
+p_strip_legends_t0t1
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0_pc_lineplot_strip_legends"
+  ),
+  plot = p_strip_legends_t0,
+  width = 8,
+  height = 1.2
+)
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t0t1_pc_lineplot_strip_legends"
+  ),
+  plot = p_strip_legends_t0t1,
+  width = 10,
+  height = 1.2
+)
+```
+
+### T1: Colocalization-based (FMC63 pairs only)
+
+```{r}
+# Pairs with FMC63 where both markers pass the CLR filter; pairs scored in >= 80% of cells
+car_col_fmc_t1 <- ColocalizationScores(car_data_t1) |>
+  filter(marker_1 %in% clr_markers_t1, marker_2 %in% clr_markers_t1) |>
+  filter(marker_1 != marker_2) |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63") |> # only pairs involving FMC63
+  mutate(feature = paste(marker_1, marker_2, sep = ":")) |>
+  select(component, feature, value = pearson_z) |>
+  make_score_object(
+    car_data_t1,
+    scores = _,
+    assay = "colocalization",
+    min_coverage = 0.8
+  ) |>
+  run_score_dr("colocalization", dims = 1:6)
+
+ElbowPlot(car_col_fmc_t1, reduction = "pca_colocalization")
+
+DimPlot(car_col_fmc_t1, group.by = "donor", reduction = "umap_colocalization") +
+  theme_classic() +
+  scale_color_manual(values = pal_donor) +
+  labs(
+    title = "UMAP of FMC63+ CD8 T cells (t1, FMC63 pairs)\nbased on colocalization scores"
+  ) &
+  theme(aspect.ratio = 1)
+
+p_dimhm <- DimHeatmap(
+  car_col_fmc_t1,
+  reduction = "pca_colocalization",
+  dims = 1:6,
+  fast = FALSE
+)
+p_dimhm
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t1_colocalization_fmc63_dim_hm"
+  ),
+  plot = p_dimhm,
+  width = 14,
+  height = 8
+)
+```
+
+```{r}
+p <- plot_umap_panels(
+  car_col_fmc_t1,
+  assay = "colocalization",
+  abund_markers = c("CD162", "CD36", "CD18"),
+  score_feats = c("CD162:FMC63", "CD36:FMC63", "CD18:FMC63"),
+  score_label = "Pearson Z"
+)
+p
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t1_colocalization_fmc63_umap"
+  ),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+tp_col_fmc_t1 <- pc_variance_explained(car_col_fmc_t1, "colocalization")
+tp_col_fmc_t1$overall
+
+p_tp_col_fmc_t1 <- plot_variance_explained(
+  tp_col_fmc_t1,
+  "Variance explained in colocalization PCs (t1, FMC63 pairs)"
+)
+p_tp_col_fmc_t1
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t1_colocalization_fmc63_pc_variance_explained"
+  ),
+  plot = p_tp_col_fmc_t1,
+  width = 7,
+  height = 4
+)
+```
+
+```{r}
+# Line plots for the top PCs
+p_col_line_grid <- purrr::map(
+  1:6,
+  \(pc) {
+    plot_pc_lines(
+      car_col_fmc_t1,
+      assay = "colocalization",
+      pc = pc,
+      y_lab = "Colocalization score (Pearson Z)",
+      noun = "colocalization pairs",
+      strips = qc_strips_t1
+    )
+  }
+) |>
+  wrap_plots(ncol = 2) &
+  theme(legend.position = "none")
+p_col_line_grid
+
+export_plot(
+  filename = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t1_colocalization_fmc63_pc1-6_top_pairs_lineplot"
+  ),
+  plot = p_col_line_grid,
+  width = 14,
+  height = 10
+)
+```
+
+```{r}
+# Number of cells per sample used in the FMC63-pair colocalization analysis
+# (cells with a complete set of scores that remain after filtering) next to
+# the number of FMC63+ CD8 T cells available at t1
+cells_per_sample_fmc_t1 <- car_col_fmc_t1@meta.data |>
+  count(sample_alias, donor, timepoint, batch, name = "n_cells_used") |>
+  left_join(
+    car_data_t1@meta.data |>
+      count(sample_alias, name = "n_cells_available"),
+    by = "sample_alias"
+  ) |>
+  mutate(n_cells_dropped = n_cells_available - n_cells_used) |>
+  arrange(donor)
+cells_per_sample_fmc_t1
+
+readr::write_csv(
+  cells_per_sample_fmc_t1,
+  here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "revised_figs",
+    "R3-2_cd8_car_t_t1_colocalization_fmc63_cells_per_sample.csv"
+  )
+)
+```
+
+
+
+# Extra
+
+Exploration of donor H samples. Could something technical explain it as an outlier?
+
+```{r}
+# data_donor_h_t0 <- data_t0t1_b1b2 |>
+#   subset(donor == "donorH" & timepoint == "t0")
+```
+
+
+# Export
+
+Export final object used in analysis.
+
+```{r}
+dir.create(
+  here("mpx_2", "results", "b1b2_t0t1", "rdata"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+saveRDS(
+  data_t0t1_b1b2,
+  file = here(
+    "mpx_2",
+    "results",
+    "b1b2_t0t1",
+    "rdata",
+    "robj_suzuki_cart_processed_data_mpx_t0t1_b1b2.rds"
+  )
+)
+
+# data_t0t1_b1b2 <- readRDS(here(
+#   "mpx_2",
+#   "results",
+#   "b1b2_t0t1",
+#   "rdata",
+#   "robj_suzuki_cart_processed_data_mpx_t0t1_b1b2.rds"
+# ))
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

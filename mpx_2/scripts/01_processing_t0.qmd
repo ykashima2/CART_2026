@@ -1,0 +1,801 @@
+---
+title: "Suzuki -- CAR-T clinical study -- Preprocessing of t0 (CAR-T product) samples, batch 1 and 2 MPX data"
+subtitle: "Pixelgen MPX data analysis"
+author: "Lovisa Franzén"
+date: "2026-09-30"
+format:
+  html:
+    theme: default
+    page-layout: full
+    code_folding: show
+    embed-resources: true
+    toc: true
+    toc-location: right
+    toc-depth: 5
+---
+
+# Description
+
+Study led by Prof. Suzuki Yutaka and Dr. Kashima Yukie (Tokyo University, Japan). Product used: Molecular Pixelation (MPX) assay.
+
+**Purpose.** This notebook processes only the CAR-T product samples (timepoint t0), taken before infusion, from both MPX batches, and creates one Seurat object for downstream t0 analyses. Samples from later timepoints (t1 and onwards, PBMC) are not included.
+
+**Data subset.** Six t0 samples, three per batch. Batch 1 is read from `mpx/data`, batch 2 from `mpx_2/data`. Batch 1 donor IDs are renamed to donor A-C, following the naming used in `02_analysis_b1b2.qmd`.
+
+| Sample ID      | Donor (original ID) | Batch   | Sample type   | Timepoint | Data folder  |
+|:---------------|:--------------------|:--------|:--------------|:---------:|:-------------|
+| TKB_CAR-T_64   | donorA (donor_32)   | batch_1 | CAR-T product | t0        | `mpx/data`   |
+| TKB_CAR_T_95   | donorB (donor_44)   | batch_1 | CAR-T product | t0        | `mpx/data`   |
+| TKB_CAR_T_105  | donorC (donor_50)   | batch_1 | CAR-T product | t0        | `mpx/data`   |
+| TKB_CAR-T_50   | donorF              | batch_2 | CAR-T product | t0        | `mpx_2/data` |
+| TKB_CAR-T_194  | donorG              | batch_2 | CAR-T product | t0        | `mpx_2/data` |
+| TKB_CAR-T_175  | donorH              | batch_2 | CAR-T product | t0        | `mpx_2/data` |
+
+**Quality control.** Each batch keeps the molecule cutoffs of its original processing (`mpx/scripts/01_processing_all_gating.qmd` and `mpx_2/scripts/01_processing_all_gating.qmd`); the other filters are the same for both batches:
+
+| Setting                    | batch_1        | batch_2                    |
+|:---------------------------|:---------------|:---------------------------|
+| Molecules per component    | 10,000-100,000 | 3,000-200,000              |
+| Top N components by rank   | none           | rank <= 2,000 per sample   |
+| Tau type                   | normal         | normal                     |
+| Isotype control percentage | < 1%           | < 1%                       |
+| ACTB percentage            | <= 1%          | <= 1%                      |
+
+*Note:* the isotype filter keeps cells with less than 1% of their molecules from isotype control antibodies. The original processing scripts compared the isotype *fraction* (0-1) with a cutoff of 1, i.e. 100%, so their filter did not remove any cells. With the corrected 1% cutoff, 3 more cells are removed here than in the original processing (1 from donorA_t0, 2 from donorH_t0), none of them CD4 or CD8 T cells. Isotype controls and ACTB are removed from the marker panel after filtering.
+
+**Processing.** All six samples are CLR-normalised together, followed by PCA, UMAP, and integration with Harmony by sample and batch.
+
+**Clustering.** Clustering is only used to view how the data separates. It is **not** used for cell type annotation.
+
+**Annotation.** Cell types are defined by marker gating on CLR values only:
+
+- T cells: CD3E > 1. All other cells are labelled "other".
+- Within T cells: CD4 > 1 and CD8 < 2 → "CD4 T"; CD4 < 1 and CD8 > 2 → "CD8 T"; any other T cell (double negative or double positive) → "T other".
+- FMC63 status: FMC63 CLR >= 1.5 → "FMC63+", otherwise "FMC63-". CD4 and CD8 T cells are split by FMC63 status ("CD4 T FMC63+", "CD4 T FMC63-", "CD8 T FMC63+", "CD8 T FMC63-"). The t0 cutoff of 1.5 is the value used for t0 in the batch 2 processing; batch 1's original processing used 0, but on its own normalisation.
+
+The cutoff values in this description match the parameters set in the code below. If a cutoff is changed in the code, update this description too.
+
+**Outputs.** Figures are written to `mpx_2/results/b1b2_t0/qc/` and `mpx_2/results/b1b2_t0/processed/`. The processed object is saved as `mpx_2/rdata/robj_suzuki_cart_processed_data_b1b2_t0.rds`.
+
+\
+
+# Setup
+
+```{r general_def}
+#| code-fold: true
+set.seed(1)
+here::i_am("mpx_2/scripts/01_processing_t0.qmd")
+
+png_res <- 300
+```
+
+```{r}
+#| code-fold: true
+#| output: false
+# Helper functions and colour palettes (pal_donor, cell_type_palette_fmc,
+# fmc_status_col, gradient_color, cell_palette_unsorted, ...)
+fn_sources <- list.files(
+  here::here("mpx_2", "scripts", "R"),
+  pattern = "*.R$",
+  full.names = TRUE
+)
+sapply(fn_sources, source, .GlobalEnv)
+```
+
+```{r}
+#| code-fold: true
+load_packages(
+  c(
+    "dplyr",
+    "tidyr",
+    "ggplot2",
+    "patchwork",
+    "pixelatorR",
+    "Seurat",
+    "harmony",
+    "here",
+    "stringr",
+    "tibble",
+    "glue",
+    "conflicted"
+  )
+)
+
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+```
+
+```{r}
+#| code-fold: true
+# Output folders
+res_dir <- here("mpx_2", "results", "b1b2_t0")
+qc_dir <- file.path(res_dir, "qc")
+proc_dir <- file.path(res_dir, "processed")
+for (d in c(qc_dir, proc_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+theme_violin <- function(base_size = 12) {
+  theme_linedraw(base_size = base_size) +
+    theme(
+      axis.text.x = element_text(angle = 60, hjust = 1),
+      axis.title.x = element_blank(),
+      panel.grid = element_blank()
+    )
+}
+```
+
+\
+
+# Read data
+
+## Sample metadata
+
+Sample metadata from both batches, restricted to the t0 samples.
+
+```{r}
+# Batch 1: metadata has no file_path column; files are named by sample ID
+mdat_b1 <- read.table(
+  here("mpx", "data", "sample_metadata.tsv"),
+  sep = "\t",
+  header = TRUE
+) |>
+  mutate(
+    donor_original = donor,
+    donor = case_when(
+      donor == "donor_32" ~ "donorA",
+      donor == "donor_44" ~ "donorB",
+      donor == "donor_50" ~ "donorC",
+      TRUE ~ donor
+    ),
+    batch = "batch_1",
+    file_path_full = here("mpx", "data", paste0(sample, ".layout.dataset.pxl"))
+  )
+
+# Batch 2
+mdat_b2 <- read.table(
+  here("mpx_2", "data", "sample_metadata.tsv"),
+  sep = "\t",
+  header = TRUE
+) |>
+  mutate(
+    donor_original = donor,
+    batch = "batch_2",
+    file_path_full = here("mpx_2", "data", file_path)
+  )
+
+mdat_df <- bind_rows(mdat_b1, mdat_b2) |>
+  filter(timepoint == "t0") |>
+  mutate(sample_alias = paste0(donor, "_", timepoint)) |>
+  select(
+    sample,
+    sample_alias,
+    donor,
+    donor_original,
+    batch,
+    type,
+    dpi,
+    timepoint,
+    file_path_full
+  )
+
+stopifnot(all(file.exists(mdat_df$file_path_full)))
+
+knitr::kable(mdat_df |> select(-file_path_full), "simple")
+```
+
+## PXL data
+
+Each sample is read separately, and its sample metadata is added before the samples are merged, so that every cell carries its sample information from the start.
+
+```{r}
+data <- lapply(seq_len(nrow(mdat_df)), function(i) {
+  obj <- ReadMPX_Seurat(
+    mdat_df$file_path_full[i],
+    load_polarity_scores = TRUE,
+    load_colocalization_scores = TRUE,
+    return_cellgraphassay = TRUE
+  )
+  sample_meta <- mdat_df[i, ] |> select(-file_path_full)
+  for (col in colnames(sample_meta)) {
+    obj[[col]] <- rep(sample_meta[[col]], ncol(obj))
+  }
+  obj
+})
+names(data) <- mdat_df$sample_alias
+
+data_combined <- merge(
+  data[[1]],
+  y = data[-1],
+  add.cell.ids = names(data)
+) |>
+  SeuratObject::JoinLayers()
+rm(data)
+
+# Molecule rank per sample (used by the batch 2 top-N filter)
+data_combined$rank <- ave(
+  -data_combined$molecules,
+  data_combined$sample_alias,
+  FUN = \(x) rank(x, ties.method = "random")
+)
+
+data_combined$sample_alias <- factor(
+  data_combined$sample_alias,
+  levels = mdat_df$sample_alias
+)
+
+table(data_combined$sample_alias, data_combined$batch)
+```
+
+\
+
+# Quality control
+
+## QC metrics
+
+Isotype control and ACTB fractions per cell, and raw FMC63 counts.
+
+```{r}
+isotype_controls <- c("mIgG1", "mIgG2a", "mIgG2b")
+
+data_combined[["isotype_total"]] <- FetchData(
+  data_combined,
+  vars = isotype_controls,
+  layer = "counts"
+) |>
+  rowSums()
+data_combined[["isotype_fraction"]] <- data_combined[["isotype_total"]] /
+  data_combined[["molecules"]]
+data_combined[["isotype_pct"]] <- data_combined[["isotype_fraction"]] * 100
+
+data_combined[["actb_total"]] <- FetchData(
+  data_combined,
+  vars = "ACTB",
+  layer = "counts"
+)
+data_combined[["actb_pct"]] <- data_combined[["actb_total"]] /
+  data_combined[["molecules"]] *
+  100
+
+data_combined[["FMC63_count"]] <- FetchData(
+  data_combined,
+  vars = "FMC63",
+  layer = "counts"
+)
+```
+
+```{r fig.width=12, fig.height=6}
+p <- MoleculeRankPlot(
+  data_combined,
+  group_by = "sample_alias",
+  highlight_cell_counts = FALSE
+) +
+  geom_hline(
+    yintercept = c(3e3, 10e3, 100e3, 200e3),
+    linetype = "dashed",
+    linewidth = 0.2
+  ) +
+  scale_color_manual(
+    values = setNames(pal_donor[mdat_df$donor], mdat_df$sample_alias)
+  ) +
+  facet_wrap(~sample_alias, ncol = 3)
+p
+
+export_plot(
+  filename = file.path(qc_dir, "qc_rank_plot"),
+  plot = p,
+  width = 12,
+  height = 6
+)
+```
+
+*Dashed lines: 3,000, 10,000, 100,000 and 200,000 molecules (the molecule cutoffs of the two batches).*
+
+```{r fig.width=12, fig.height=10}
+p <- data_combined[[]] |>
+  select(
+    sample_alias,
+    donor,
+    batch,
+    molecules,
+    mean_molecules_per_a_pixel,
+    reads,
+    mean_reads_per_molecule,
+    isotype_pct,
+    actb_pct
+  ) |>
+  pivot_longer(
+    cols = c(
+      molecules,
+      mean_molecules_per_a_pixel,
+      reads,
+      mean_reads_per_molecule,
+      isotype_pct,
+      actb_pct
+    ),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  ggplot(aes(sample_alias, value, fill = donor)) +
+  geom_violin(draw_quantiles = 0.5) +
+  scale_fill_manual(values = pal_donor) +
+  facet_grid(metric ~ batch, scales = "free", space = "free_x") +
+  scale_y_log10() +
+  theme_violin()
+p
+
+export_plot(
+  filename = file.path(qc_dir, "qc_metrics_violins"),
+  plot = p,
+  width = 12,
+  height = 10
+)
+```
+
+```{r fig.width=12, fig.height=8}
+p <- TauPlot(data_combined, group_by = "sample_alias")
+p
+
+export_plot(
+  filename = file.path(qc_dir, "qc_tau_plot"),
+  plot = p,
+  width = 12,
+  height = 8
+)
+```
+
+Only components with the 'normal' Tau type are kept.
+
+```{r fig.width=6, fig.height=4}
+p <- VlnPlot(
+  data_combined,
+  features = "FMC63",
+  group.by = "sample_alias",
+  layer = "counts",
+  pt.size = 0.01,
+  cols = setNames(pal_donor[mdat_df$donor], mdat_df$sample_alias)
+) &
+  theme_violin() &
+  scale_y_log10() &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 counts (log10 scale)")
+p
+
+export_plot(
+  filename = file.path(qc_dir, "qc_marker_fmc63_violin"),
+  plot = p,
+  width = 6,
+  height = 4
+)
+```
+
+## Filtering
+
+Each batch is filtered with the settings of its original processing (see Description).
+
+```{r}
+# Per-batch QC cutoffs. If changed, update the table in the Description.
+qc_cutoffs <- tibble::tribble(
+  ~batch    , ~umi_cutoff_low , ~umi_cutoff_high , ~top_n_cells ,
+  "batch_1" ,            10e3 ,            100e3 , Inf          ,
+  "batch_2" ,             3e3 ,            200e3 ,          2e3
+)
+
+isotype_cutoff <- 1 # Isotype control markers < 1%
+actb_pct_cutoff <- 1 # ACTB <= 1% of molecules
+
+components_keep <- data_combined[[]] |>
+  rownames_to_column("component") |>
+  left_join(qc_cutoffs, by = "batch") |>
+  filter(
+    molecules >= umi_cutoff_low,
+    molecules <= umi_cutoff_high,
+    rank <= top_n_cells,
+    tau_type == "normal",
+    isotype_pct < isotype_cutoff,
+    actb_pct <= actb_pct_cutoff
+  ) |>
+  pull(component)
+
+data_filt <- data_combined |> subset(cells = components_keep)
+rm(data_combined)
+```
+
+```{r fig.width=5, fig.height=4}
+p <- CellCountPlot(data_filt, color_by = "sample_alias") &
+  scale_fill_manual(
+    values = setNames(pal_donor[mdat_df$donor], mdat_df$sample_alias)
+  ) &
+  theme_linedraw(base_size = 12) &
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+p
+
+export_plot(
+  filename = file.path(qc_dir, "qc_post_filter_ncells_sample"),
+  plot = p,
+  width = 5,
+  height = 4
+)
+```
+
+Isotype controls and ACTB are removed from the marker panel so that they do not drive separation between cells.
+
+```{r}
+markers_keep <- setdiff(rownames(data_filt), c(isotype_controls, "ACTB"))
+data_filt <- subset(data_filt, features = markers_keep)
+
+message(glue(
+  "Keeping {length(markers_keep)} markers for the downstream analysis."
+))
+data_filt
+```
+
+\
+
+# Data processing
+
+## CLR normalization
+
+```{r}
+data_t0 <- data_filt |>
+  NormalizeMPX(method = "clr") |>
+  ScaleData()
+rm(data_filt)
+```
+
+## PCA & UMAP
+
+```{r fig.width=6, fig.height=4}
+data_t0 <- data_t0 |> RunPCA()
+ElbowPlot(data_t0, ndims = 30)
+```
+
+```{r}
+n_dims <- 15
+data_t0 <- data_t0 |>
+  RunUMAP(reduction = "pca", dims = 1:n_dims, reduction.name = "umap.pca")
+```
+
+## Harmony & UMAP
+
+Integration of the PCs by sample and batch.
+
+```{r}
+integrate_by <- c("sample", "batch")
+
+data_t0 <- data_t0 |>
+  RunHarmony(group.by.vars = integrate_by, plot_convergence = FALSE) |>
+  RunUMAP(
+    reduction = "harmony",
+    dims = 1:n_dims,
+    reduction.name = "umap.harmony"
+  )
+```
+
+```{r fig.width=18, fig.height=5}
+pt_size <- 0.5
+umap_by <- function(reduction, group_by, cols, title) {
+  DimPlot(
+    data_t0,
+    reduction = reduction,
+    group.by = group_by,
+    cols = cols,
+    pt.size = pt_size
+  ) +
+    labs(title = title) +
+    theme(aspect.ratio = 1)
+}
+
+p <- umap_by("umap.pca", "donor", pal_donor, "PCA UMAP, donor") |
+  umap_by("umap.harmony", "donor", pal_donor, "Harmony UMAP, donor") |
+  umap_by("umap.harmony", "batch", NULL, "Harmony UMAP, batch")
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_umap_pca_harmony_dimplot"),
+  plot = p,
+  width = 18,
+  height = 5
+)
+```
+
+```{r fig.width=16, fig.height=4}
+p <- FeaturePlot(
+  data_t0,
+  features = c("CD3E", "CD4", "CD8", "FMC63"),
+  ncol = 4,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  pt.size = pt_size
+) &
+  theme(aspect.ratio = 1)
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_umap_harmony_featureplot"),
+  plot = p,
+  width = 16,
+  height = 4
+)
+```
+
+## Clustering (visualisation only)
+
+Clusters are computed only to view how the data separates. They are **not** used for cell type annotation, which is done by marker gating below.
+
+```{r}
+cluster_res <- 0.5
+
+data_t0 <- data_t0 |>
+  FindNeighbors(dims = 1:n_dims, reduction = "harmony") |>
+  FindClusters(resolution = cluster_res)
+```
+
+```{r fig.width=12, fig.height=5}
+dot_markers <- intersect(
+  c(
+    "CD3E",
+    "CD4",
+    "CD8",
+    "FMC63",
+    "CD19",
+    "CD20",
+    "CD14",
+    "CD16",
+    "CD56",
+    "CD41",
+    "CD45RA",
+    "CD45RO"
+  ),
+  rownames(data_t0)
+)
+
+p1 <- DimPlot(
+  data_t0,
+  reduction = "umap.harmony",
+  group.by = "seurat_clusters",
+  cols = cell_palette_unsorted,
+  label = TRUE,
+  pt.size = pt_size
+) +
+  theme(aspect.ratio = 1) +
+  labs(title = "Clusters (not used for annotation)")
+
+p2 <- DotPlot(data_t0, features = dot_markers, group.by = "seurat_clusters") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- p1 | p2
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_umap_harmony_clusters"),
+  plot = p,
+  width = 12,
+  height = 5
+)
+```
+
+\
+
+# Cell type annotation by gating
+
+## Gating thresholds
+
+T cells are defined by CD3E, then split into CD4 and CD8 T cells, and by FMC63 status. The cutoffs are shown on the density plots below.
+
+```{r}
+# Gating cutoffs on CLR values. If changed, update the Description.
+cutoff_cd3 <- 1
+cutoff_cd4 <- 1
+cutoff_cd8 <- 2
+fmc63_cutoff_clr_t0 <- 1.5
+```
+
+```{r fig.width=14, fig.height=10}
+gate_plot <- function(marker1, marker2, hline = NULL, vline = NULL) {
+  DensityScatterPlot(
+    data_t0,
+    marker1 = marker1,
+    marker2 = marker2,
+    layer = "data",
+    facet_vars = "sample_alias",
+    pt_size = 0.5
+  ) &
+    geom_hline(yintercept = hline, linetype = "dashed", colour = "red") &
+    geom_vline(xintercept = vline, linetype = "dashed", colour = "red") &
+    theme_linedraw() &
+    theme(panel.grid = element_blank())
+}
+
+p <- gate_plot("CD3E", "CD4", hline = cutoff_cd4, vline = cutoff_cd3) |
+  gate_plot("CD3E", "CD8", hline = cutoff_cd8, vline = cutoff_cd3) |
+  gate_plot("CD4", "CD8", hline = cutoff_cd8, vline = cutoff_cd4) |
+  gate_plot("CD3E", "FMC63", hline = fmc63_cutoff_clr_t0, vline = cutoff_cd3)
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_gating_density_plots"),
+  plot = p,
+  width = 14,
+  height = 10
+)
+```
+
+## Annotation
+
+```{r}
+gating_data <- FetchData(
+  data_t0,
+  vars = c("CD3E", "CD4", "CD8", "FMC63"),
+  layer = "data"
+)
+
+gating_data <- gating_data |>
+  mutate(
+    FMC63_clr = FMC63,
+    FMC63_status_clr = ifelse(FMC63 >= fmc63_cutoff_clr_t0, "FMC63+", "FMC63-"),
+    tcell_gated = case_when(
+      CD3E <= cutoff_cd3 ~ "other",
+      CD4 > cutoff_cd4 & CD8 < cutoff_cd8 ~ "CD4 T",
+      CD4 < cutoff_cd4 & CD8 > cutoff_cd8 ~ "CD8 T",
+      TRUE ~ "T other"
+    ),
+    celltype = ifelse(
+      tcell_gated %in% c("CD4 T", "CD8 T"),
+      paste(tcell_gated, FMC63_status_clr),
+      tcell_gated
+    ),
+    celltype_broad = tcell_gated
+  )
+
+data_t0 <- AddMetaData(
+  data_t0,
+  gating_data |>
+    select(FMC63_clr, FMC63_status_clr, tcell_gated, celltype, celltype_broad)
+)
+
+celltype_levels <- c(
+  "CD4 T FMC63+",
+  "CD4 T FMC63-",
+  "CD8 T FMC63+",
+  "CD8 T FMC63-",
+  "T other",
+  "other"
+)
+data_t0$celltype <- factor(data_t0$celltype, levels = celltype_levels)
+```
+
+```{r}
+celltype_counts <- data_t0[[]] |>
+  count(sample_alias, batch, celltype, name = "n_cells") |>
+  mutate(pct = round(100 * n_cells / sum(n_cells), 1), .by = sample_alias)
+
+celltype_counts |>
+  select(-pct) |>
+  pivot_wider(names_from = celltype, values_from = n_cells, values_fill = 0) |>
+  knitr::kable("simple")
+
+# FMC63+ share of CD4 and CD8 T cells per sample, to review the FMC63 cutoff
+data_t0[[]] |>
+  filter(tcell_gated %in% c("CD4 T", "CD8 T")) |>
+  summarise(
+    n_cells = n(),
+    pct_fmc63_pos = round(100 * mean(FMC63_status_clr == "FMC63+"), 1),
+    .by = c(sample_alias, tcell_gated)
+  ) |>
+  pivot_wider(
+    names_from = tcell_gated,
+    values_from = c(n_cells, pct_fmc63_pos)
+  ) |>
+  knitr::kable("simple")
+```
+
+```{r fig.width=12, fig.height=5}
+annotation_cols <- c(cell_type_palette_fmc, "other" = "grey80")
+
+p1 <- DimPlot(
+  data_t0,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = annotation_cols,
+  pt.size = pt_size
+) +
+  theme(aspect.ratio = 1) +
+  labs(title = "Gated cell types")
+
+p2 <- ggplot(celltype_counts, aes(sample_alias, pct, fill = celltype)) +
+  geom_col(colour = "black", linewidth = 0.2) +
+  scale_fill_manual(values = annotation_cols) +
+  theme_linedraw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(x = NULL, y = "Cells (%)", fill = "Cell type")
+
+p <- p1 | p2
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_gated_celltypes_umap_proportions"),
+  plot = p,
+  width = 12,
+  height = 5
+)
+```
+
+```{r fig.width=14, fig.height=8}
+p <- DimPlot(
+  data_t0,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  split.by = "sample_alias",
+  cols = annotation_cols,
+  ncol = 3,
+  pt.size = pt_size
+) +
+  theme(aspect.ratio = 1)
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_gated_celltypes_umap_split"),
+  plot = p,
+  width = 14,
+  height = 8
+)
+```
+
+Check of the final annotation: marker levels per gated cell type.
+
+```{r fig.width=16, fig.height=6}
+celltypes_plot <- grep("^CD", celltype_levels, value = TRUE)
+check_plot <- function(marker1, marker2) {
+  DensityScatterPlot(
+    subset(data_t0, celltype %in% celltypes_plot),
+    marker1 = marker1,
+    marker2 = marker2,
+    layer = "data",
+    facet_vars = "celltype",
+    pt_size = 0.5
+  ) &
+    theme_linedraw() &
+    theme(panel.grid = element_blank())
+}
+
+p <- check_plot("CD3E", "CD4") |
+  check_plot("CD3E", "CD8") |
+  check_plot("CD4", "CD8") |
+  check_plot("CD3E", "FMC63")
+p
+
+export_plot(
+  filename = file.path(proc_dir, "t0_gated_celltypes_density_check"),
+  plot = p,
+  width = 16,
+  height = 6
+)
+```
+
+\
+
+# Export processed data
+
+```{r}
+data_t0$celltype <- as.character(data_t0$celltype)
+
+saveRDS(
+  data_t0,
+  file = here("mpx_2", "rdata", "robj_suzuki_cart_processed_data_b1b2_t0.rds")
+)
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
