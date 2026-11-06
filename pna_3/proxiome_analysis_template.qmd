@@ -1,0 +1,100 @@
+---
+title: "Proxiome Analysis: pna_3 axi-cel validation set"
+subtitle: "v0.6.2"
+format:
+  html:
+    toc: true
+    toc-location: left
+    theme: cosmo
+    code-copy: true
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+execute:
+  execute-dir: project
+  echo: true
+  warning: false
+  message: false
+---
+
+This template describes a standard workflow for analyzing single cell PNA data using the `pixelatorR` package in R. This is the stand-alone validation set of five axi-cel samples (t0 vs t1) that mirrors the `pna_b1b2` analysis; only the t1 vs t0 axi-cel comparison is tested. It covers data loading, quality control, clustering, annotation, abundance, proximity, optional statistical testing, optional single-cell graph visualization, and optional data interpretation.
+
+**Important:** Users must actively review and adjust quality control thresholds, select markers, and most critically, perform manual cell type annotation based on marker expression patterns. Automated annotation provides a starting point but should always be verified and refined through careful inspection of differential abundance patterns and marker distributions.
+
+**How to run interactively:** Open and run the numbered notebooks in `modules/` in order (`01` through `04`; `05` is optional, `02b` is the separate platelet clean-up and `08` makes the supplementary figures). Start with `01_quality_control.qmd`. R packages come from the shared renv project in the root directory (`renv::restore()`); open the project from the `.Rproj` file in this folder so it loads automatically.
+
+**How to re-render everything:** Render this file when you want a single HTML report of the full workflow at the end of a project (requires [Quarto](https://quarto.org/)).
+
+**Where to edit:** Steps that depend on your experiment are labeled **Decision checkpoint** in each module. Search for **Decision checkpoint** in the module you are running.
+
+## Project Folder Structure
+
+```         
+.
+├── data/
+│   ├── metadata.csv
+│   └── *.pxl
+│
+├── modules/
+│   ├── common_setup.R                 # Shared setup (sourced automatically)
+│   ├── marker_selection_functions.R   # CLR-based marker selection helpers
+│   ├── platelet_cleanup_functions.R   # Helpers for 02b
+│   ├── 01_quality_control.qmd
+│   ├── 02_clustering_annotation.qmd
+│   ├── 02b_platelet_cleanup.qmd       # Optional: platelet clean-up (long run)
+│   ├── 03_abundance.qmd
+│   ├── 04_proximity.qmd
+│   ├── 05_statistical_testing.qmd     # Optional
+│   └── 08_manuscript_figures.qmd      # Supplementary figures
+│
+├── modules_cleaned/                   # Modules 03, 04, 05 on the platelet-cleaned T cell object
+│   ├── 00_setup_cleaned.R
+│   ├── 03_abundance_cleaned.qmd
+│   ├── 04_proximity_cleaned.qmd
+│   └── 05_statistical_testing_cleaned.qmd
+│
+├── proxiome_analysis_platelet_cleaned.qmd # Full re-render of the cleaned modules
+│
+├── results/
+│   ├── checkpoint_data/               # Saved between modules
+│   │   ├── pg_data_merged.rds         # After module 01 (QC-filtered)
+│   │   ├── selected_markers.rds       # After module 01
+│   │   ├── annotated_seurat_object.rds # After module 02
+│   │   ├── markers_to_test.rds        # After module 02
+│   │   ├── platelet_tcell_protein_weights.rds # After module 02
+│   │   └── pg_data_platelet_cleaned.rds # After module 02b
+│   ├── 01_quality_control/
+│   ├── 02_clustering_annotation/
+│   ├── 02b_platelet_cleanup/
+│   ├── 03_abundance/
+│   ├── 04_proximity/
+│   ├── 05_statistical_testing/
+│   └── 08_manuscript_figures/
+│
+└── results_cleaned/                   # Output of modules_cleaned/
+    ├── 03_abundance/
+    ├── 04_proximity/
+    └── 05_statistical_testing/
+```
+
+**Note:**
+
+- All plots are saved in both PDF and PNG formats.
+- Folder numbering (01–05, 02b, 08) corresponds to the analysis modules. `results_cleaned/` holds the output of `modules_cleaned/`.
+
+{{< include modules/01_quality_control.qmd >}}
+
+{{< include modules/02_clustering_annotation.qmd >}}
+
+{{< include modules/03_abundance.qmd >}}
+
+{{< include modules/04_proximity.qmd >}}
+
+{{< include modules/05_statistical_testing.qmd >}}
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

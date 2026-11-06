@@ -1,0 +1,1485 @@
+# 8. Supplementary figures
+
+**Module 08 — Supplementary figures.** Generates the supplementary figures for the pna_3 axi-cel validation set (five samples: donorO t0 and t1, donorP t1, donorQ t1 and donorR t0). The set is analysed on its own and is meant to be compared with the axi-cel samples of `pna_b1b2`. Run the first chunk below to load packages, shared code and the checkpoints saved by modules `01`–`02` (and `02b`, if it has been run). You can open this module in a new R session once those checkpoints exist.
+
+This module:
+
+- loads shared code, palettes and helper functions from `common_setup.R`, the annotated object (`pg_data`) and, when available, the platelet-cleaned object (`pg_data_clean`) from the checkpoint folder
+- contains only **descriptive** plots. No differential test results are plotted, so module `05` is not needed
+- saves every figure to `results/08_manuscript_figures/` as `figS<N>_*` (png and pdf, controlled by `options(export_plot.file_formats)` in `common_setup.R`). Each figure is a supplementary figure with its own numbering (S1, S2, ...)
+- uses proximity scores from the platelet-cleaned object when `pg_data_platelet_cleaned.rds` exists, and otherwise from the PXL-backed `pg_data` (the plot subtitles say which one was used)
+
+With one paired donor only (donorO), t0 and t1 are mostly different donors. Per-sample values are therefore always shown as individual points, and lines connect t0 and t1 only for donorO.
+
+| Figure | Content | Source |
+|:--|:--|:--|
+| S1 | UMAP: annotation, timepoint, donor, FMC63 abundance | `pg_data` (module `02`) |
+| S2 | FMC63 abundance per cell annotation and timepoint (violin) | `pg_data` |
+| S3 | Cell annotation proportions per donor, t0 and t1 | `pg_data` |
+| S4 | Cell counts and annotation composition per sample, FMC63+ fraction of CD4/CD8 T cells | `pg_data` |
+| S5 | FMC63 top colocalizing proteins per sample (heatmap) | proximity scores |
+| S6 | FMC63 top colocalizing proteins per timepoint (heatmap) | proximity scores |
+| S7 | FMC63 colocalization per donor at t0 (bubble plot) | proximity scores |
+| S8 | FMC63 colocalization per donor at t1 (bubble plot) | proximity scores |
+| S9 | Single-cell graphs of CD8 FMC63+ T cells | `pg_data` (PXL) |
+| S10 | Raw abundance (mean CLR) of selected markers per sample, t0 vs t1 | `pg_data` |
+| S11 | Mean CLR per marker, t0 vs t1 | `pg_data` |
+| S12 | Raw colocalization scores of selected marker pairs per sample, t0 vs t1 | proximity scores |
+| S13 | Mean colocalization score per marker pair, t0 vs t1 | proximity scores |
+| S14 | Per-sample heatmap of the most variable marker pairs | proximity scores |
+| S15–S20 | Comparison with the axi-cel samples of `pna_b1b2` (heatmaps, concordance, selected pairs, abundance, PCA). Only run when both platelet-cleaned objects exist | cleaned objects of `pna_3` and `pna_b1b2` |
+
+```{r}
+#| label: module08_setup
+
+library(here)
+here::i_am("pna_3/modules/08_manuscript_figures.qmd")
+
+source(here::here("pna_3", "modules", "common_setup.R"))
+source(here::here("pna_3", "modules", "marker_selection_functions.R"))
+
+library(ggbeeswarm)
+library(patchwork)
+library(ggalluvial)
+library(ggrepel)
+
+if (!exists("pg_data", inherits = TRUE)) {
+  pg_data <- load_checkpoint("annotated_seurat_object.rds")
+}
+
+# The platelet-cleaned object only exists once module 02b has been run. All
+# proximity-based figures fall back to the PXL-backed pg_data without it.
+if (!exists("pg_data_clean", inherits = TRUE)) {
+  pg_data_clean <- load_checkpoint(
+    "pg_data_platelet_cleaned.rds",
+    required = FALSE
+  )
+}
+prox_cleaned <- !is.null(pg_data_clean)
+pg_prox <- if (prox_cleaned) pg_data_clean else pg_data
+prox_label <- if (prox_cleaned) {
+  "platelet-cleaned data"
+} else {
+  "not platelet-cleaned"
+}
+message("Proximity scores from: ", prox_label)
+
+# Output folder for all supplementary figures
+supp_dir <- here::here("pna_3", "results", "08_manuscript_figures")
+dir.create(supp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save a figure as supp_dir/<name>.{png,pdf}
+supp_save <- function(name, plot, width = 5, height = 5) {
+  export_plot(
+    filename = file.path(supp_dir, name),
+    plot = plot,
+    width = width,
+    height = height
+  )
+}
+
+# Colours for t0 / t1 and one row per sample
+timepoint_cols <- sample_annotation_colors$timepoint
+sample_info <- metadata |>
+  distinct(sample_alias, donor, timepoint) |>
+  mutate(timepoint = factor(timepoint, levels = names(timepoint_cols)))
+
+# Donors with both timepoints get a line between their t0 and t1 points
+paired_donors <- sample_info |>
+  summarise(n_tp = n_distinct(timepoint), .by = donor) |>
+  filter(n_tp == 2) |>
+  pull(donor)
+
+# Parameters shared by the proximity-based figures
+coloc_cell_type <- "CD8 T FMC63+"
+coloc_min_cells <- 15L
+coloc_min_mean_clr <- 0.5
+```
+
+## 8.1. S1: UMAP
+
+UMAP of the PNA data (Harmony-corrected embedding, `harmony_umap`), shown as four panels coloured by cell annotation, timepoint, donor and FMC63 abundance (CLR).
+
+```{r}
+#| label: figS1_umap
+pt_size <- 0.25
+
+p1 <- DimPlot(
+  object = pg_data,
+  reduction = "harmony_umap",
+  group.by = "cell_annotation",
+  cols = cell_type_palette_fmc,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = pg_data,
+  reduction = "harmony_umap",
+  group.by = "timepoint",
+  cols = timepoint_cols,
+  pt.size = pt_size
+) +
+  labs(title = "Timepoint") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = pg_data,
+  reduction = "harmony_umap",
+  group.by = "donor",
+  pt.size = pt_size,
+  cols = pal_donor
+) +
+  labs(title = "Donor") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- FeaturePlot(
+  object = pg_data,
+  reduction = "harmony_umap",
+  features = "FMC63",
+  slot = "data",
+  cols = c("#E5E5E5", "#053061"),
+  min.cutoff = -1,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 abundance (CLR)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- wrap_plots(p1, p2, p3, p4, ncol = 2)
+supp_save("figS1_pna_umap", p, width = 7 * 1.5, height = 6 * 1.5)
+```
+
+## 8.2. S2: FMC63 abundance per timepoint
+
+FMC63 abundance (CLR) per cell annotation, split by timepoint.
+
+```{r}
+#| label: figS2_fmc63_violin
+p <- VlnPlot(
+  pg_data,
+  features = "FMC63",
+  split.by = "timepoint",
+  group.by = "cell_annotation",
+  pt.size = 0.1
+) &
+  scale_fill_manual(values = timepoint_cols)
+
+supp_save("figS2_fmc63_timepoint_violin", p, width = 6, height = 4)
+```
+
+## 8.3. S3: Cell annotation proportions
+
+Cell annotation proportions (%) per donor, with t0 and t1 side by side. Alluvia connect the proportions between timepoints for donorO, the only donor with both. The underlying table is saved as `figS3_celltype_frequency_table.csv`.
+
+```{r}
+#| label: figS3_cell_proportions
+cellcluster_freq <- pg_data@meta.data |>
+  filter(timepoint %in% c("t0", "t1")) |>
+  group_by(donor, timepoint, cell_annotation) |>
+  summarize(n_cells = n(), .groups = "drop_last") |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(cell_annotation = as.factor(cell_annotation)) |>
+  ungroup()
+
+p <- ggplot(cellcluster_freq, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = cell_annotation, fill = cell_annotation),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = cell_annotation), width = .5, color = "black") +
+  # free_x/space = "free_x" keeps bar widths comparable across donors
+  facet_grid(~donor, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = cell_type_palette_fmc) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(
+    title = "Cell proportions across donors",
+    y = "Cell type proportion (%)",
+    x = "Timepoint",
+    fill = "Cell type"
+  ) +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+supp_save("figS3_cell_proportions_sankey", p, width = 9, height = 5)
+
+write.table(
+  x = cellcluster_freq,
+  file = file.path(supp_dir, "figS3_celltype_frequency_table.csv"),
+  sep = ",",
+  row.names = FALSE
+)
+```
+
+Export table with number of T cells per sample (platelet-cleaned data)
+
+```{r}
+cell_tbl_export <- pg_data_clean@meta.data |>
+  # select(sample_alias, donor, timepoint, cell_annotation) |>
+  group_by(sample_alias, donor, timepoint, cell_annotation) |>
+  summarize(n_cells = n()) |>
+  arrange(cell_annotation)
+
+write.table(
+  x = cell_tbl_export,
+  file = file.path(
+    supp_dir,
+    "figS3_celltype_frequency_table_tcells_plat_cleanup.csv"
+  ),
+  sep = ",",
+  row.names = FALSE
+)
+```
+
+## 8.4. S4: Cells per sample and FMC63+ fraction
+
+Left: number of cells per sample after QC, with the cell annotation composition as proportions. Right: fraction of FMC63+ cells among the CD4 and CD8 T cells of each sample.
+
+```{r}
+#| label: figS4_sample_composition
+comp_df <- pg_data@meta.data |>
+  count(sample_alias, cell_annotation, name = "n_cells") |>
+  mutate(pct = 100 * n_cells / sum(n_cells), .by = sample_alias) |>
+  left_join(sample_info, by = "sample_alias")
+
+sample_totals <- comp_df |>
+  summarise(total = sum(n_cells), .by = c(sample_alias, timepoint, donor))
+
+p_comp <- ggplot(
+  comp_df,
+  aes(x = sample_alias, y = pct, fill = cell_annotation)
+) +
+  geom_col(color = "black", width = 0.7) +
+  geom_text(
+    data = sample_totals,
+    aes(x = sample_alias, y = 101, label = paste0("n = ", total), fill = NULL),
+    vjust = 0,
+    size = 3
+  ) +
+  facet_grid(~timepoint, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = cell_type_palette_fmc) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.08)),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(x = NULL, y = "Cell type proportion (%)", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fmc_frac <- pg_data@meta.data |>
+  mutate(
+    lineage = stringr::str_extract(cell_annotation, "^CD[48] T"),
+    fmc63 = stringr::str_extract(cell_annotation, "FMC63[+-]")
+  ) |>
+  filter(!is.na(lineage), !is.na(fmc63)) |>
+  summarise(
+    n_cells = n(),
+    frac_fmc63_pos = mean(fmc63 == "FMC63+"),
+    .by = c(sample_alias, donor, timepoint, lineage)
+  ) |>
+  mutate(timepoint = factor(timepoint, levels = names(timepoint_cols)))
+
+p_fmc <- ggplot(
+  fmc_frac,
+  aes(x = timepoint, y = frac_fmc63_pos, color = donor)
+) +
+  geom_line(
+    data = filter(fmc_frac, donor %in% paired_donors),
+    aes(group = donor),
+    color = "grey50"
+  ) +
+  geom_point(aes(size = n_cells)) +
+  facet_wrap(~lineage) +
+  scale_color_manual(values = pal_donor) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  scale_size_continuous(range = c(1.5, 5)) +
+  labs(
+    x = "Timepoint",
+    y = "FMC63+ fraction of T cells",
+    color = "Donor",
+    size = "Cells"
+  ) +
+  cowplot::theme_minimal_hgrid()
+
+p <- p_comp + p_fmc + plot_layout(widths = c(1.2, 1))
+supp_save("figS4_sample_composition_fmc63_fraction", p, width = 14, height = 5)
+```
+
+## 8.5. Proximity scores for the colocalization figures
+
+The proximity scores of the cell type of interest are collected once and summarized per sample (mean log2 ratio per marker pair). They are reused by S7, S8 and S12–S14.
+
+```{r}
+#| label: coloc_scores_per_sample
+prox_meta_cols <- c("sample_alias", "donor", "cell_annotation", "timepoint")
+
+coloc_scores <- ProximityScores(
+  pg_prox,
+  lazy = !prox_cleaned,
+  meta_data_columns = prox_meta_cols
+) |>
+  filter(cell_annotation == coloc_cell_type) |>
+  collect() |>
+  SummarizeProximityScores(
+    group_vars = prox_meta_cols,
+    proximity_metric = "log2_ratio",
+    summary_stat = "mean",
+    include_missing_obs = TRUE
+  ) |>
+  filter(marker_1 != marker_2) |>
+  mutate(
+    pair = paste(
+      pmin(marker_1, marker_2),
+      pmax(marker_1, marker_2),
+      sep = " - "
+    )
+  )
+
+# Samples with enough cells, and markers present above the CLR cutoff in all of them
+clr_means_coloc <- compute_sample_clr_means(
+  pg_prox,
+  cell_types = coloc_cell_type,
+  min_cells_per_sample = coloc_min_cells
+)
+included_samples <- unique(clr_means_coloc$sample)
+passing_markers <- summarise_marker_clr(clr_means_coloc, coloc_min_mean_clr) |>
+  filter(pass) |>
+  pull(marker)
+
+message(
+  coloc_cell_type,
+  ": ",
+  length(included_samples),
+  " samples and ",
+  length(passing_markers),
+  " markers pass the filters"
+)
+
+coloc_scores <- coloc_scores |>
+  filter(sample_alias %in% included_samples) |>
+  mutate(timepoint = factor(timepoint, levels = names(timepoint_cols)))
+```
+
+
+
+
+## 8.6. S5 and S6: FMC63 top colocalizing proteins
+
+The top FMC63 colocalization partners (mean log2 ratio) of CD8 FMC63+ T cells, per sample (S5) and averaged per timepoint (S6). Markers are limited to those passing the CLR criterion in all samples with enough cells.
+
+```{r}
+#| label: figS5_figS6_fmc63_partners
+marker_of_interest <- "FMC63"
+max_heatmap_markers <- 50
+
+fmc_partners <- coloc_scores |>
+  filter(marker_1 == marker_of_interest | marker_2 == marker_of_interest) |>
+  mutate(
+    marker = if_else(marker_1 == marker_of_interest, marker_2, marker_1)
+  ) |>
+  filter(marker %in% passing_markers) |>
+  select(sample_alias, timepoint, marker, mean_log2_ratio)
+
+partner_mat <- fmc_partners |>
+  select(-timepoint) |>
+  pivot_wider(names_from = sample_alias, values_from = mean_log2_ratio) |>
+  column_to_rownames("marker") |>
+  as.matrix()
+
+markers_keep <- partner_mat |>
+  as.data.frame() |>
+  mutate(avg = rowMeans(across(where(is.numeric)), na.rm = TRUE)) |>
+  arrange(desc(abs(avg))) |>
+  slice_head(n = max_heatmap_markers) |>
+  rownames()
+
+# Cluster markers (columns of the plotted matrix) while tolerating NA
+cluster_cols_na <- function(mat) {
+  if (ncol(mat) < 2) {
+    return(FALSE)
+  }
+  d <- dist(t(mat))
+  finite_d <- is.finite(d)
+  if (!any(finite_d)) {
+    return(FALSE)
+  }
+  d[!finite_d] <- max(d[finite_d])
+  hclust(d)
+}
+
+symmetric_breaks <- function(x) {
+  max_abs <- max(abs(quantile(x, probs = c(0.01, 0.99), na.rm = TRUE)))
+  if (!is.finite(max_abs) || max_abs == 0) {
+    max_abs <- 1
+  }
+  seq(-max_abs, max_abs, length.out = 101)
+}
+
+# S5: per sample, t0 samples first
+sample_order <- sample_info |>
+  arrange(timepoint, sample_alias) |>
+  pull(sample_alias) |>
+  intersect(colnames(partner_mat))
+hm_mat <- t(partner_mat[markers_keep, sample_order, drop = FALSE])
+
+hm_sample <- pheatmap::pheatmap(
+  hm_mat,
+  color = PixelgenGradient(100, "BluesCherry"),
+  breaks = symmetric_breaks(hm_mat),
+  na_col = "grey85",
+  border_color = "white",
+  cellwidth = 8,
+  cellheight = 8,
+  cluster_rows = FALSE,
+  cluster_cols = cluster_cols_na(hm_mat),
+  treeheight_col = 10,
+  annotation_row = sample_annotation[
+    sample_order,
+    rev(sample_annotation_cols),
+    drop = FALSE
+  ],
+  annotation_colors = sample_annotation_colors,
+  main = paste0(
+    "FMC63 colocalization in ",
+    coloc_cell_type,
+    "\n(",
+    prox_label,
+    ")"
+  ),
+  fontsize = 8,
+  silent = TRUE
+) |>
+  ggplotify::as.ggplot()
+supp_save(
+  "figS5_fmc63_top_colocalizing_proteins_per_sample",
+  hm_sample,
+  width = 16,
+  height = 4
+)
+
+# S6: mean over samples per timepoint
+group_mat <- fmc_partners |>
+  filter(marker %in% markers_keep) |>
+  summarise(
+    mean_log2_ratio = mean(mean_log2_ratio, na.rm = TRUE),
+    n_samples = n_distinct(sample_alias),
+    .by = c(timepoint, marker)
+  )
+group_info <- group_mat |>
+  distinct(timepoint, n_samples) |>
+  arrange(timepoint)
+group_wide <- group_mat |>
+  select(timepoint, marker, mean_log2_ratio) |>
+  pivot_wider(names_from = marker, values_from = mean_log2_ratio) |>
+  arrange(timepoint) |>
+  column_to_rownames("timepoint") |>
+  as.matrix()
+group_wide <- group_wide[
+  as.character(group_info$timepoint),
+  markers_keep,
+  drop = FALSE
+]
+
+hm_group <- pheatmap::pheatmap(
+  group_wide,
+  color = PixelgenGradient(100, "BluesCherry"),
+  breaks = symmetric_breaks(group_wide),
+  na_col = "grey85",
+  border_color = "white",
+  cellwidth = 8,
+  cellheight = 8,
+  cluster_rows = FALSE,
+  cluster_cols = cluster_cols_na(group_wide),
+  treeheight_col = 10,
+  labels_row = paste0(
+    group_info$timepoint,
+    " (n = ",
+    group_info$n_samples,
+    ")"
+  ),
+  annotation_row = data.frame(
+    timepoint = as.character(group_info$timepoint),
+    row.names = as.character(group_info$timepoint)
+  ),
+  annotation_colors = sample_annotation_colors["timepoint"],
+  main = paste0(
+    "FMC63 colocalization in ",
+    coloc_cell_type,
+    " (mean per timepoint)\n(",
+    prox_label,
+    ")"
+  ),
+  fontsize = 8,
+  silent = TRUE
+) |>
+  ggplotify::as.ggplot()
+supp_save(
+  "figS6_fmc63_top_colocalizing_proteins_per_timepoint",
+  hm_group,
+  width = 16,
+  height = 3
+)
+```
+
+## 8.7. S7 and S8: FMC63 colocalization per donor
+
+Bubble plots of FMC63 colocalization (mean log2 ratio) per sample for CD8 FMC63+ T cells, at t0 (S7) and t1 (S8). Markers are ordered by clustering the marker x marker colocalization of the selected timepoint.
+
+```{r}
+#| label: figS7_figS8_fmc63_bubble
+fmc_bubble <- function(tp_select, color_range) {
+  tp_samples <- sample_info |>
+    filter(timepoint == tp_select) |>
+    pull(sample_alias)
+  scores_tp <- coloc_scores |> filter(sample_alias %in% tp_samples)
+
+  # Marker order from a clustered marker x marker heatmap (mean over samples)
+  coloc_dat_tp <- scores_tp |>
+    filter(marker_1 %in% passing_markers, marker_2 %in% passing_markers) |>
+    select(donor, marker_1, marker_2, mean_log2_ratio) |>
+    pivot_wider(names_from = donor, values_from = mean_log2_ratio) |>
+    mutate(
+      mean_coloc_score = rowMeans(across(-c(marker_1, marker_2)), na.rm = TRUE),
+      size_constant = 1
+    )
+  p_ref <- ColocalizationHeatmap_custom(
+    coloc_dat_tp,
+    value_col = "mean_coloc_score",
+    size_col = "size_constant",
+    type = "dots",
+    clustering_method = "ward.D2",
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    size_range = c(1, 4.5)
+  )
+  m_order <- ggplot2::ggplot_build(p_ref)$layout$panel_params[[
+    1
+  ]]$x$get_labels()
+
+  fmc_data <- scores_tp |>
+    filter(marker_1 == "FMC63" | marker_2 == "FMC63") |>
+    mutate(
+      marker = ifelse(marker_1 == "FMC63", marker_2, marker_1),
+      patient = gsub("donor", "Donor ", donor)
+    ) |>
+    filter(marker %in% c("FMC63", m_order)) |>
+    select(marker, patient, mean_log2_ratio)
+
+  DifferentialBubblePlot(
+    data = fmc_data,
+    color_palette = colors,
+    has_pvalues = FALSE,
+    effect_cutoff = 0,
+    color_range = color_range,
+    group_var = "patient",
+    size_range = 5,
+    effect_col = "mean_log2_ratio"
+  ) +
+    labs(
+      fill = "Mean\ncolocalization\n(log2 ratio)",
+      title = paste0(
+        "FMC63 colocalization in ",
+        coloc_cell_type,
+        " (",
+        toupper(tp_select),
+        ")"
+      ),
+      subtitle = prox_label
+    ) +
+    theme_linedraw() +
+    theme(
+      legend.position = "right",
+      panel.grid.major.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.margin = margin(t = 2, r = 0, b = 0, l = 0, unit = "cm")
+    )
+}
+
+supp_save(
+  "figS7_fmc63_coloc_per_donor_t0",
+  fmc_bubble("t0", c(-0.8, 0.8)),
+  width = 13,
+  height = 3
+)
+supp_save(
+  "figS8_fmc63_coloc_per_donor_t1",
+  fmc_bubble("t1", c(-1, 1)),
+  width = 13,
+  height = 3.5
+)
+```
+
+## 8.8. S9: Single-cell graphs
+
+2D graph layouts of CD8 FMC63+ T cells for a few selected markers. This uses the non-cleaned `pg_data`, which reads the cell graphs from the PXL files. For each sample, the cell closest to the sample median CD48-CD52 colocalization is shown, so the cells are representative rather than extreme.
+
+```{r}
+#| label: figS9_cell_viz_parameters
+cell_type_of_interest <- "CD8 T FMC63+"
+markers_to_viz <- c("FMC63", "CD48", "CD52", "CD55", "CD59", "CD45")
+pair_for_selection <- c("CD48", "CD52")
+```
+
+```{r}
+#| label: figS9_cell_viz_select_cells
+colocscores_cell_viz <- ProximityScores(
+  pg_data,
+  lazy = TRUE,
+  meta_data_columns = c("sample_alias", "donor", "cell_annotation", "timepoint")
+) |>
+  filter(cell_annotation == cell_type_of_interest) |>
+  filter(marker_1 %in% pair_for_selection, marker_2 %in% pair_for_selection) |>
+  filter(marker_1 != marker_2, join_count > 5) |>
+  collect()
+
+cells_of_interest_tbl <- colocscores_cell_viz |>
+  mutate(med = median(log2_ratio), .by = sample_alias) |>
+  slice_min(
+    abs(log2_ratio - med),
+    n = 1,
+    with_ties = FALSE,
+    by = sample_alias
+  ) |>
+  arrange(timepoint, donor)
+
+cells_of_interest <- cells_of_interest_tbl$component
+if (length(cells_of_interest) == 0) {
+  stop(
+    "No cells found for '",
+    cell_type_of_interest,
+    "'. Check the values in `cell_annotation`."
+  )
+}
+cells_of_interest_tbl |>
+  select(component, sample_alias, donor, timepoint, log2_ratio)
+```
+
+```{r}
+#| label: figS9_cell_viz_layout
+pg_data <- LoadCellGraphs(
+  pg_data,
+  cells = cells_of_interest,
+  add_layouts = TRUE,
+  verbose = FALSE
+)
+pg_data <- ComputeLayout(pg_data, layout_method = "cpmds") # for the 3D view
+```
+
+```{r}
+#| label: figS9_cell_viz_2d
+p_2d <- Plot2DGraphM(
+  pg_data,
+  cells = cells_of_interest,
+  markers = markers_to_viz,
+  layout_method = "cpmds_3d"
+)
+
+supp_save(
+  "figS9_2d_graph_selected_proteins_cpmds_3d",
+  p_2d,
+  width = length(cells_of_interest) * 3 + 1,
+  height = length(markers_to_viz) * 3 + 0.5
+)
+```
+
+## 8.9. S10 and S11: Raw abundance, t0 vs t1
+
+Raw abundance scores (mean CLR per sample) for CD8 T cells. No test is applied: each point is one sample, colour is donor, and the line connects the t0 and t1 sample of donorO. Samples with fewer than `abundance_min_cells` cells of a cell type are left out.
+
+```{r}
+#| label: abundance_sample_means
+abundance_cell_types <- intersect(
+  c("CD8 T FMC63+", "CD8 T FMC63-"),
+  unique(pg_data$cell_annotation)
+)
+abundance_min_cells <- 15L
+abundance_markers <- c(
+  "FMC63",
+  "CD8",
+  "CD4",
+  "CD43",
+  "CD71",
+  "CD69",
+  "CD25",
+  "CD38",
+  "HLA-DR",
+  "PD-1",
+  "CD45RO",
+  "CD45RA",
+  "CD27",
+  "CD28"
+)
+abundance_markers <- intersect(abundance_markers, rownames(pg_data))
+
+clr_means <- compute_sample_clr_means(
+  pg_data,
+  cell_types = abundance_cell_types,
+  min_cells_per_sample = abundance_min_cells
+) |>
+  left_join(sample_info, by = c("sample" = "sample_alias"))
+```
+
+```{r}
+#| label: figS10_marker_beeswarm
+p <- clr_means |>
+  filter(marker %in% abundance_markers) |>
+  mutate(marker = factor(marker, levels = abundance_markers)) |>
+  ggplot(aes(x = timepoint, y = mean_clr, color = donor)) +
+  geom_line(
+    data = \(d) filter(d, donor %in% paired_donors),
+    aes(group = donor),
+    color = "grey50"
+  ) +
+  geom_point(aes(size = n_cells)) +
+  stat_summary(
+    aes(group = 1),
+    fun = mean,
+    geom = "crossbar",
+    width = 0.5,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  facet_grid(group ~ marker, scales = "free_y") +
+  scale_color_manual(values = pal_donor) +
+  scale_size_continuous(range = c(1.5, 4)) +
+  labs(
+    x = "Timepoint",
+    y = "Mean CLR per sample",
+    color = "Donor",
+    size = "Cells",
+    title = "Raw marker abundance per sample, t0 vs t1",
+    subtitle = "Black bar: mean of samples. Line: paired donor."
+  ) +
+  cowplot::theme_minimal_hgrid() +
+  theme(strip.text = element_text(size = 8))
+
+supp_save(
+  "figS10_marker_abundance_per_sample_t0_vs_t1",
+  p,
+  width = 1.4 * length(abundance_markers) + 1.5,
+  height = 2.5 * length(abundance_cell_types) + 1.5
+)
+```
+
+```{r}
+#| label: figS11_marker_scatter
+# Mean over samples per timepoint
+tp_means <- clr_means |>
+  summarise(
+    mean_clr = mean(mean_clr),
+    n_samples = n(),
+    .by = c(group, marker, timepoint)
+  ) |>
+  pivot_wider(
+    names_from = timepoint,
+    values_from = c(mean_clr, n_samples)
+  ) |>
+  filter(!is.na(mean_clr_t0), !is.na(mean_clr_t1)) |>
+  mutate(delta = mean_clr_t1 - mean_clr_t0)
+
+n_label <- 10
+p <- ggplot(tp_means, aes(x = mean_clr_t0, y = mean_clr_t1)) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.7, color = "#1F395F") +
+  geom_text_repel(
+    data = \(d) slice_max(d, abs(delta), n = n_label, by = group),
+    aes(label = marker),
+    size = 3,
+    max.overlaps = Inf
+  ) +
+  facet_wrap(~group) +
+  coord_equal() +
+  labs(
+    x = "Mean CLR at t0",
+    y = "Mean CLR at t1",
+    title = "Marker abundance, t0 vs t1",
+    subtitle = paste0(
+      "Mean over samples; top ",
+      n_label,
+      " markers by difference labelled; dashed line: identity"
+    )
+  ) +
+  cowplot::theme_minimal_grid()
+
+supp_save(
+  "figS11_marker_abundance_t0_vs_t1_scatter",
+  p,
+  width = 5 * length(abundance_cell_types) + 1,
+  height = 5.5
+)
+```
+
+## 8.10. S12 and S13: Raw colocalization scores, t0 vs t1
+
+Raw colocalization scores (mean log2 ratio per sample) of CD8 FMC63+ T cells, again without any test.
+
+```{r}
+#| label: figS12_pair_beeswarm
+pairs_plot <- c(
+  "CD48 - CD52",
+  "CD45 - FMC63",
+  "CD29 - FMC63",
+  "CD11a - CD53",
+  "CD37 - CD81",
+  "FMC63 - ICOS",
+  "CD5 - PD-1"
+)
+pairs_plot <- intersect(pairs_plot, unique(coloc_scores$pair))
+
+p <- coloc_scores |>
+  filter(pair %in% pairs_plot) |>
+  mutate(pair = factor(pair, levels = pairs_plot)) |>
+  ggplot(aes(x = timepoint, y = mean_log2_ratio, color = donor)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(
+    data = \(d) filter(d, donor %in% paired_donors),
+    aes(group = donor),
+    color = "grey50"
+  ) +
+  geom_point(size = 2.5) +
+  stat_summary(
+    aes(group = 1),
+    fun = mean,
+    geom = "crossbar",
+    width = 0.5,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  facet_wrap(~pair, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = pal_donor) +
+  labs(
+    x = "Timepoint",
+    y = "Mean colocalization (log2 ratio)",
+    color = "Donor",
+    title = paste0("Raw colocalization scores in ", coloc_cell_type),
+    subtitle = paste0(
+      "Black bar: mean of samples. Line: paired donor. ",
+      prox_label
+    )
+  ) +
+  cowplot::theme_minimal_hgrid()
+
+supp_save(
+  "figS12_colocalization_pairs_per_sample_t0_vs_t1",
+  p,
+  width = 2.2 * length(pairs_plot) + 1.5,
+  height = 4
+)
+```
+
+```{r}
+#| label: figS13_coloc_scatter
+pair_means <- coloc_scores |>
+  filter(marker_1 %in% passing_markers, marker_2 %in% passing_markers) |>
+  summarise(
+    mean_log2_ratio = mean(mean_log2_ratio, na.rm = TRUE),
+    .by = c(pair, timepoint)
+  ) |>
+  pivot_wider(names_from = timepoint, values_from = mean_log2_ratio) |>
+  filter(!is.na(t0), !is.na(t1)) |>
+  mutate(delta = t1 - t0)
+
+p <- ggplot(pair_means, aes(x = t0, y = t1)) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.5, color = "#1F395F") +
+  geom_text_repel(
+    data = \(d) slice_max(d, abs(delta), n = 12),
+    aes(label = pair),
+    size = 3,
+    max.overlaps = Inf
+  ) +
+  coord_equal() +
+  labs(
+    x = "Mean colocalization at t0 (log2 ratio)",
+    y = "Mean colocalization at t1 (log2 ratio)",
+    title = paste0(
+      "Marker pair colocalization in ",
+      coloc_cell_type,
+      ", t0 vs t1"
+    ),
+    subtitle = paste0(
+      "Mean over samples; top 12 pairs by difference labelled. ",
+      prox_label
+    )
+  ) +
+  cowplot::theme_minimal_grid()
+
+supp_save("figS13_colocalization_t0_vs_t1_scatter", p, width = 7, height = 7)
+```
+
+## 8.11. S14: Most variable marker pairs per sample
+
+Per-sample colocalization scores (mean log2 ratio) of the `n_pairs_heatmap` marker pairs that vary the most between samples (standard deviation across samples), with samples ordered t0 first and then t1.
+
+```{r}
+#| label: figS14_pair_heatmap
+n_pairs_heatmap <- 40
+
+pair_wide <- coloc_scores |>
+  filter(marker_1 %in% passing_markers, marker_2 %in% passing_markers) |>
+  select(sample_alias, pair, mean_log2_ratio) |>
+  pivot_wider(names_from = sample_alias, values_from = mean_log2_ratio) |>
+  column_to_rownames("pair") |>
+  as.matrix()
+pair_wide <- pair_wide[rowSums(is.na(pair_wide)) == 0, , drop = FALSE]
+
+top_pairs <- names(sort(apply(pair_wide, 1, sd), decreasing = TRUE))[
+  seq_len(min(n_pairs_heatmap, nrow(pair_wide)))
+]
+sample_order <- sample_info |>
+  arrange(timepoint, sample_alias) |>
+  pull(sample_alias) |>
+  intersect(colnames(pair_wide))
+
+hm_pairs <- pheatmap::pheatmap(
+  pair_wide[top_pairs, sample_order, drop = FALSE],
+  color = PixelgenGradient(100, "BluesCherry"),
+  breaks = symmetric_breaks(pair_wide[top_pairs, , drop = FALSE]),
+  border_color = "white",
+  cellwidth = 14,
+  cellheight = 9,
+  cluster_cols = FALSE,
+  annotation_col = sample_annotation[
+    sample_order,
+    rev(sample_annotation_cols),
+    drop = FALSE
+  ],
+  annotation_colors = sample_annotation_colors,
+  main = paste0(
+    "Most variable marker pairs in ",
+    coloc_cell_type,
+    "\n(",
+    prox_label,
+    ")"
+  ),
+  fontsize = 8,
+  silent = TRUE
+) |>
+  ggplotify::as.ggplot()
+
+supp_save(
+  "figS14_most_variable_pairs_heatmap_per_sample",
+  hm_pairs,
+  width = 6,
+  height = 7
+)
+```
+
+## 8.12. Comparison with pna_b1b2 (axi-cel)
+
+Comparison of the `pna_3` samples with the axi-cel samples of `pna_b1b2` (2 at t0, 6 at t1, all batch `b2`), for CD8 FMC63+ T cells unless stated otherwise. `pna_3` is treated as its own batch (`pna_3`). Everything here is descriptive: no test is run.
+
+The comparison needs the platelet-cleaned objects of **both** projects, so that the two batches are processed the same way. The chunks below are skipped (and the module still renders) unless `pna_3` proximity scores come from the cleaned object (`pg_data_platelet_cleaned.rds`, module `02b`) and `pna_b1b2/results/checkpoint_data/pg_data_platelet_cleaned.rds` exists. The `pna_b1b2` files are only read, never written.
+
+Markers are limited to those with mean CLR > `coloc_min_mean_clr` in every sample (of both batches) with at least `coloc_min_cells` cells.
+
+| Figure | Content |
+|:--|:--|
+| S15 | FMC63 top colocalizing proteins, mean per batch and timepoint (heatmap) |
+| S16 | FMC63 top colocalizing proteins, per sample, both batches (heatmap) |
+| S17 | Mean colocalization per marker pair, `pna_3` vs `b2`, at t0 and t1 (scatter) |
+| S18 | Selected marker pairs per sample, both batches, t0 vs t1 |
+| S19 | Raw marker abundance (mean CLR) per sample, both batches, t0 vs t1 |
+| S20 | PCA of sample-level colocalization and abundance profiles |
+
+```{r}
+#| label: compare_setup
+b1b2_dir <- here::here("pna_b1b2", "results", "checkpoint_data")
+b1b2_clean_path <- file.path(b1b2_dir, "pg_data_platelet_cleaned.rds")
+b1b2_metadata_path <- here::here("pna_b1b2", "data", "metadata.csv")
+
+run_compare <- prox_cleaned &&
+  file.exists(b1b2_clean_path) &&
+  file.exists(b1b2_metadata_path)
+if (!run_compare) {
+  message(
+    "Skipping section 8.12: it needs the platelet-cleaned objects of pna_3 ",
+    "(module 02b) and pna_b1b2."
+  )
+}
+
+batch_cols <- c("b2" = "#D6604D", "pna_3" = "#4393C3")
+batch_levels <- names(batch_cols)
+timepoint_shapes <- c("t0" = 16, "t1" = 17)
+```
+
+```{r}
+#| label: compare_load_b1b2
+#| eval: !expr run_compare
+
+# Axi-cel samples of pna_b1b2, from its metadata (batch and donor per sample)
+b1b2_sample_info <- read.csv(b1b2_metadata_path) |>
+  as_tibble() |>
+  filter(construct == "axi-cel") |>
+  transmute(sample_alias, donor, timepoint, batch = "b2")
+
+sample_all <- bind_rows(
+  sample_info |> mutate(timepoint = as.character(timepoint), batch = "pna_3"),
+  b1b2_sample_info
+) |>
+  mutate(
+    timepoint = factor(timepoint, levels = names(timepoint_cols)),
+    batch = factor(batch, levels = batch_levels),
+    batch_tp = paste(batch, timepoint)
+  )
+
+paired_all <- sample_all |>
+  summarise(n_tp = n_distinct(timepoint), .by = c(batch, donor)) |>
+  filter(n_tp == 2) |>
+  pull(donor)
+
+b1b2_clean <- readRDS(b1b2_clean_path)
+
+# Mean CLR per sample x cell type x marker (all markers; used for S19 and S20)
+abundance_cell_types_cmp <- intersect(
+  c("CD8 T FMC63+", "CD8 T FMC63-"),
+  unique(pg_prox$cell_annotation)
+)
+clr_cmp <- bind_rows(
+  compute_sample_clr_means(
+    pg_prox,
+    cell_types = abundance_cell_types_cmp,
+    min_cells_per_sample = coloc_min_cells
+  ),
+  compute_sample_clr_means(
+    b1b2_clean,
+    cell_types = abundance_cell_types_cmp,
+    min_cells_per_sample = coloc_min_cells
+  ) |>
+    filter(sample %in% b1b2_sample_info$sample_alias)
+) |>
+  left_join(sample_all, by = c("sample" = "sample_alias"))
+
+# Mean log2 ratio per sample and marker pair for the pna_b1b2 axi-cel samples
+coloc_b1b2 <- ProximityScores(
+  b1b2_clean,
+  lazy = FALSE,
+  meta_data_columns = c("sample_alias", "cell_annotation")
+) |>
+  filter(
+    cell_annotation == coloc_cell_type,
+    sample_alias %in% b1b2_sample_info$sample_alias
+  ) |>
+  collect() |>
+  SummarizeProximityScores(
+    group_vars = c("sample_alias", "cell_annotation"),
+    proximity_metric = "log2_ratio",
+    summary_stat = "mean",
+    include_missing_obs = TRUE
+  ) |>
+  filter(marker_1 != marker_2) |>
+  mutate(
+    pair = paste(
+      pmin(marker_1, marker_2),
+      pmax(marker_1, marker_2),
+      sep = " - "
+    )
+  )
+
+rm(b1b2_clean)
+invisible(gc())
+
+# Samples and markers that pass the filters in BOTH batches
+clr_cmp_coloc <- clr_cmp |> filter(group == coloc_cell_type)
+included_all <- unique(clr_cmp_coloc$sample)
+passing_both <- summarise_marker_clr(clr_cmp_coloc, coloc_min_mean_clr) |>
+  filter(pass) |>
+  pull(marker)
+message(
+  length(included_all),
+  " samples and ",
+  length(passing_both),
+  " markers pass the filters in both batches"
+)
+
+coloc_all <- bind_rows(
+  coloc_scores |>
+    select(sample_alias, marker_1, marker_2, mean_log2_ratio, pair),
+  coloc_b1b2 |>
+    select(sample_alias, marker_1, marker_2, mean_log2_ratio, pair)
+) |>
+  filter(
+    sample_alias %in% included_all,
+    marker_1 %in% passing_both,
+    marker_2 %in% passing_both
+  ) |>
+  left_join(sample_all, by = "sample_alias")
+
+rm(coloc_b1b2)
+
+group_order <- sample_all |>
+  arrange(timepoint, batch) |>
+  pull(batch_tp) |>
+  unique()
+
+batch_annotation_colors <- c(
+  sample_annotation_colors["timepoint"],
+  list(batch = batch_cols)
+)
+```
+
+### S15 and S16: FMC63 top colocalizing proteins in both batches
+
+The top FMC63 partners (mean log2 ratio, CD8 FMC63+ T cells) averaged per batch and timepoint (S15, `n` is the number of samples) and for each sample (S16).
+
+```{r}
+#| label: figS15_figS16_fmc63_partners_batches
+#| eval: !expr run_compare
+fmc_partners_all <- coloc_all |>
+  filter(marker_1 == "FMC63" | marker_2 == "FMC63") |>
+  mutate(marker = if_else(marker_1 == "FMC63", marker_2, marker_1))
+
+# Same top partners in both figures: strongest on average over the batch x
+# timepoint means, so that both batches contribute equally
+group_means <- fmc_partners_all |>
+  summarise(
+    mean_log2_ratio = mean(mean_log2_ratio, na.rm = TRUE),
+    n_samples = n_distinct(sample_alias),
+    .by = c(batch_tp, batch, timepoint, marker)
+  )
+markers_keep_cmp <- group_means |>
+  summarise(avg = mean(mean_log2_ratio, na.rm = TRUE), .by = marker) |>
+  slice_max(abs(avg), n = max_heatmap_markers) |>
+  pull(marker)
+
+# S15: batch x timepoint
+group_info <- group_means |>
+  distinct(batch_tp, batch, timepoint, n_samples) |>
+  mutate(batch_tp = factor(batch_tp, levels = group_order)) |>
+  arrange(batch_tp)
+group_mat <- group_means |>
+  filter(marker %in% markers_keep_cmp) |>
+  select(batch_tp, marker, mean_log2_ratio) |>
+  pivot_wider(names_from = marker, values_from = mean_log2_ratio) |>
+  column_to_rownames("batch_tp") |>
+  as.matrix()
+group_mat <- group_mat[
+  as.character(group_info$batch_tp),
+  markers_keep_cmp,
+  drop = FALSE
+]
+
+hm_batch_group <- pheatmap::pheatmap(
+  group_mat,
+  color = PixelgenGradient(100, "BluesCherry"),
+  breaks = symmetric_breaks(group_mat),
+  na_col = "grey85",
+  border_color = "white",
+  cellwidth = 8,
+  cellheight = 12,
+  cluster_rows = FALSE,
+  cluster_cols = cluster_cols_na(group_mat),
+  treeheight_col = 10,
+  labels_row = paste0(group_info$batch_tp, " (n = ", group_info$n_samples, ")"),
+  annotation_row = data.frame(
+    timepoint = as.character(group_info$timepoint),
+    batch = as.character(group_info$batch),
+    row.names = as.character(group_info$batch_tp)
+  ),
+  annotation_colors = batch_annotation_colors,
+  main = paste0(
+    "FMC63 colocalization in ",
+    coloc_cell_type,
+    " (mean per batch and timepoint)\n(",
+    prox_label,
+    ")"
+  ),
+  fontsize = 8,
+  silent = TRUE
+) |>
+  ggplotify::as.ggplot()
+supp_save(
+  "figS15_fmc63_top_colocalizing_proteins_batch_timepoint",
+  hm_batch_group,
+  width = 16,
+  height = 3.5
+)
+
+# S16: per sample
+sample_order_cmp <- sample_all |>
+  filter(sample_alias %in% included_all) |>
+  arrange(timepoint, batch, sample_alias) |>
+  pull(sample_alias)
+sample_mat <- fmc_partners_all |>
+  filter(marker %in% markers_keep_cmp) |>
+  select(sample_alias, marker, mean_log2_ratio) |>
+  pivot_wider(names_from = marker, values_from = mean_log2_ratio) |>
+  column_to_rownames("sample_alias") |>
+  as.matrix()
+sample_mat <- sample_mat[sample_order_cmp, markers_keep_cmp, drop = FALSE]
+
+hm_batch_sample <- pheatmap::pheatmap(
+  sample_mat,
+  color = PixelgenGradient(100, "BluesCherry"),
+  breaks = symmetric_breaks(sample_mat),
+  na_col = "grey85",
+  border_color = "white",
+  cellwidth = 8,
+  cellheight = 8,
+  cluster_rows = FALSE,
+  cluster_cols = cluster_cols_na(sample_mat),
+  treeheight_col = 10,
+  annotation_row = sample_all |>
+    filter(sample_alias %in% sample_order_cmp) |>
+    mutate(across(c(timepoint, batch), as.character)) |>
+    select(sample_alias, batch, timepoint) |>
+    column_to_rownames("sample_alias") |>
+    _[sample_order_cmp, , drop = FALSE],
+  annotation_colors = batch_annotation_colors,
+  main = paste0(
+    "FMC63 colocalization in ",
+    coloc_cell_type,
+    " (per sample)\n(",
+    prox_label,
+    ")"
+  ),
+  fontsize = 8,
+  silent = TRUE
+) |>
+  ggplotify::as.ggplot()
+supp_save(
+  "figS16_fmc63_top_colocalizing_proteins_batch_per_sample",
+  hm_batch_sample,
+  width = 16,
+  height = 5
+)
+```
+
+### S17: Concordance between batches
+
+Mean colocalization (log2 ratio) of every marker pair, averaged over the samples of each batch, with `pna_3` on the y axis and `b2` (pna_b1b2 axi-cel) on the x axis. One panel per timepoint. The dashed line is identity. The ten pairs that differ most are labelled.
+
+```{r}
+#| label: figS17_concordance_scatter
+#| eval: !expr run_compare
+batch_pair_means <- coloc_all |>
+  summarise(
+    mean_log2_ratio = mean(mean_log2_ratio, na.rm = TRUE),
+    .by = c(pair, batch, timepoint)
+  ) |>
+  pivot_wider(names_from = batch, values_from = mean_log2_ratio) |>
+  filter(!is.na(b2), !is.na(pna_3)) |>
+  mutate(diff = pna_3 - b2)
+
+concordance_stats <- batch_pair_means |>
+  summarise(
+    pearson = cor(b2, pna_3, method = "pearson"),
+    spearman = cor(b2, pna_3, method = "spearman"),
+    n_pairs = n(),
+    .by = timepoint
+  ) |>
+  mutate(
+    label = sprintf(
+      "r = %.2f\nrho = %.2f\n%d pairs",
+      pearson,
+      spearman,
+      n_pairs
+    )
+  )
+
+p <- ggplot(batch_pair_means, aes(x = b2, y = pna_3)) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.5, color = "#1F395F") +
+  geom_text_repel(
+    data = \(d) slice_max(d, abs(diff), n = 10, by = timepoint),
+    aes(label = pair),
+    size = 2.8,
+    max.overlaps = Inf
+  ) +
+  geom_text(
+    data = concordance_stats,
+    aes(x = -Inf, y = Inf, label = label),
+    hjust = -0.1,
+    vjust = 1.1,
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~timepoint) +
+  coord_equal() +
+  labs(
+    x = "Mean colocalization, pna_b1b2 axi-cel (log2 ratio)",
+    y = "Mean colocalization, pna_3 (log2 ratio)",
+    title = paste0(
+      "Marker pair colocalization in ",
+      coloc_cell_type,
+      ": pna_3 vs pna_b1b2"
+    ),
+    subtitle = paste0("Mean over samples per batch. ", prox_label)
+  ) +
+  cowplot::theme_minimal_grid()
+
+supp_save(
+  "figS17_colocalization_batch_concordance_scatter",
+  p,
+  width = 11,
+  height = 6
+)
+```
+
+### S18: Selected marker pairs in both batches
+
+Raw colocalization scores per sample for the pairs of S12. Colour is batch, the line connects t0 and t1 of donors that have both, and the black bars are the batch means.
+
+```{r}
+#| label: figS18_pairs_batches
+#| eval: !expr run_compare
+pairs_cmp <- intersect(pairs_plot, unique(coloc_all$pair))
+
+p <- coloc_all |>
+  filter(pair %in% pairs_cmp) |>
+  mutate(pair = factor(pair, levels = pairs_cmp)) |>
+  ggplot(aes(x = timepoint, y = mean_log2_ratio, color = batch)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(
+    data = \(d) filter(d, donor %in% paired_all),
+    aes(group = donor),
+    color = "grey60"
+  ) +
+  geom_point(position = position_dodge(width = 0.4), size = 2.2) +
+  stat_summary(
+    aes(group = batch),
+    fun = mean,
+    geom = "crossbar",
+    width = 0.35,
+    linewidth = 0.3,
+    position = position_dodge(width = 0.4),
+    show.legend = FALSE
+  ) +
+  facet_wrap(~pair, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = batch_cols) +
+  labs(
+    x = "Timepoint",
+    y = "Mean colocalization (log2 ratio)",
+    color = "Batch",
+    title = paste0(
+      "Raw colocalization scores in ",
+      coloc_cell_type,
+      ": pna_3 vs pna_b1b2"
+    ),
+    subtitle = paste0("Bars: batch means. Lines: paired donors. ", prox_label)
+  ) +
+  cowplot::theme_minimal_hgrid()
+
+supp_save(
+  "figS18_colocalization_pairs_batches",
+  p,
+  width = 2.4 * length(pairs_cmp) + 1.5,
+  height = 4
+)
+```
+
+### S19: Raw marker abundance in both batches
+
+Mean CLR per sample for the markers of S10, for CD8 FMC63+ and CD8 FMC63- T cells, with batch added.
+
+```{r}
+#| label: figS19_abundance_batches
+#| eval: !expr run_compare
+abundance_markers_cmp <- intersect(abundance_markers, unique(clr_cmp$marker))
+
+p <- clr_cmp |>
+  filter(marker %in% abundance_markers_cmp) |>
+  mutate(marker = factor(marker, levels = abundance_markers_cmp)) |>
+  ggplot(aes(x = timepoint, y = mean_clr, color = batch)) +
+  geom_line(
+    data = \(d) filter(d, donor %in% paired_all),
+    aes(group = donor),
+    color = "grey60"
+  ) +
+  geom_point(
+    aes(size = n_cells),
+    position = position_dodge(width = 0.4),
+    alpha = 0.85
+  ) +
+  stat_summary(
+    aes(group = batch),
+    fun = mean,
+    geom = "crossbar",
+    width = 0.35,
+    linewidth = 0.3,
+    position = position_dodge(width = 0.4),
+    show.legend = FALSE
+  ) +
+  facet_grid(group ~ marker, scales = "free_y") +
+  scale_color_manual(values = batch_cols) +
+  scale_size_continuous(range = c(1.2, 3.5)) +
+  labs(
+    x = "Timepoint",
+    y = "Mean CLR per sample",
+    color = "Batch",
+    size = "Cells",
+    title = "Raw marker abundance per sample: pna_3 vs pna_b1b2 (platelet-cleaned)",
+    subtitle = "Bars: batch means. Lines: paired donors."
+  ) +
+  cowplot::theme_minimal_hgrid() +
+  theme(strip.text = element_text(size = 8))
+
+supp_save(
+  "figS19_marker_abundance_batches",
+  p,
+  width = 1.4 * length(abundance_markers_cmp) + 1.5,
+  height = 2.5 * length(abundance_cell_types_cmp) + 1.5
+)
+```
+
+### S20: PCA of sample-level profiles
+
+PCA of the samples, one point per sample (label is donor), based on (left) the colocalization scores of all marker pairs of CD8 FMC63+ T cells and (right) the mean CLR of all markers in CD8 FMC63+ T cells. Features are scaled, and features with a missing value in any sample are dropped. It shows whether samples separate by batch or by timepoint.
+
+```{r}
+#| label: figS20_pca_batches
+#| eval: !expr run_compare
+sample_pca_plot <- function(feature_by_sample, title) {
+  mat <- t(feature_by_sample)
+  keep <- apply(mat, 2, function(x) all(is.finite(x)) && sd(x) > 0)
+  mat <- mat[, keep, drop = FALSE]
+  pc <- prcomp(mat, scale. = TRUE)
+  var_expl <- round(100 * summary(pc)$importance[2, 1:2], 1)
+  as_tibble(pc$x[, 1:2], rownames = "sample_alias") |>
+    left_join(sample_all, by = "sample_alias") |>
+    ggplot(aes(PC1, PC2, color = batch, shape = timepoint)) +
+    geom_point(size = 3.5) +
+    geom_text_repel(aes(label = donor), size = 3, show.legend = FALSE) +
+    scale_color_manual(values = batch_cols) +
+    scale_shape_manual(values = timepoint_shapes) +
+    labs(
+      title = title,
+      subtitle = paste0(ncol(mat), " features"),
+      x = paste0("PC1 (", var_expl[1], "%)"),
+      y = paste0("PC2 (", var_expl[2], "%)")
+    ) +
+    cowplot::theme_minimal_grid()
+}
+
+coloc_feature_mat <- coloc_all |>
+  select(pair, sample_alias, mean_log2_ratio) |>
+  pivot_wider(names_from = sample_alias, values_from = mean_log2_ratio) |>
+  column_to_rownames("pair") |>
+  as.matrix()
+abundance_feature_mat <- clr_cmp |>
+  filter(group == coloc_cell_type) |>
+  select(marker, sample, mean_clr) |>
+  pivot_wider(names_from = sample, values_from = mean_clr) |>
+  column_to_rownames("marker") |>
+  as.matrix()
+
+p <- sample_pca_plot(coloc_feature_mat, "Colocalization profiles") +
+  sample_pca_plot(abundance_feature_mat, "Abundance profiles") +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = paste0(
+      "Sample-level profiles of ",
+      coloc_cell_type,
+      " (",
+      prox_label,
+      ")"
+    )
+  )
+
+supp_save("figS20_sample_pca_batches", p, width = 12, height = 5.5)
+```

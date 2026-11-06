@@ -1,0 +1,45 @@
+---
+title: "Proxiome Analysis: Platelet-Cleaned Data"
+subtitle: "Modules 03, 04 and 05 on the T-cell object from module 02b"
+format:
+  html:
+    toc: true
+    toc-location: left
+    theme: cosmo
+    code-copy: true
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+execute:
+  execute-dir: project
+  echo: true
+  warning: false
+  message: false
+---
+
+This report repeats the abundance, proximity and statistical testing modules on the platelet-cleaned T-cell object (`pg_data_platelet_cleaned.rds`) written by module `02b`. The original analysis (`proxiome_analysis_template.qmd`, `modules/`) is unchanged.
+
+**Where things live:**
+
+- Module scripts: `modules_cleaned/` (copies of modules `03`, `04`, `05` with `_cleaned` suffix, plus `00_setup_cleaned.R`).
+- Input: `results/checkpoint_data/pg_data_platelet_cleaned.rds` (and `markers_to_test.rds`, restricted to the four T-cell types).
+- Output: `results_cleaned/{03_abundance, 04_proximity, 05_statistical_testing}/`.
+
+**Differences from the original modules:**
+
+- Only the four T-cell types in the cleaned object are analysed (CD4/CD8 T, FMC63+/-).
+- `ProximityScores(..., lazy = FALSE)`: the cleaned object holds its proximity scores in memory, not in a PXL database.
+- The platelet-marker refinement section of module `04` is removed.
+
+{{< include modules_cleaned/03_abundance_cleaned.qmd >}}
+
+{{< include modules_cleaned/04_proximity_cleaned.qmd >}}
+
+{{< include modules_cleaned/05_statistical_testing_cleaned.qmd >}}
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

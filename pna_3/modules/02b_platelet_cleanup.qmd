@@ -1,0 +1,524 @@
+# 2b. Platelet clean-up
+
+**Module 02b — Platelet clean-up.** Removes platelet contamination from the T cells of all PNA samples at the level of the cell graphs. Run module `02` first: it saves the annotated object, the platelet / T cell protein weights (`w`) and the platelet / T cell labels as checkpoints. You can open this module in a new R session once those checkpoints exist.
+
+For every T cell (`anno_platelet == "tcell"`) the cell graph is loaded and:
+
+1. **Segmented** into `tcell`, `platelet`, `interface` and `other` nodes with the protein weights `w` (`pixelatorR::segment_cell()`).
+2. **Filtered**: the fraction of the cell covered by platelet patches is computed for every cell, and cells at or above the cutoff (`max_contam_fraction`) are removed.
+3. **Reduced** to the `tcell` compartment (platelet patches, interface and unclassified nodes are dropped).
+4. **Recomputed**: protein counts (`partition_counts()`) and proximity scores (`ComputeProximityScores(mode = "analytical")`) are recomputed from the reduced graphs.
+
+Cell graphs are heavy, so the work is done in **batches** of cells from one sample at a time. The batch size is calibrated from the memory use of a pilot set of cells. Every batch is written to `results/02b_platelet_cleanup/batches/` (counts, proximity scores, QC table and the filtered cell graphs), so a stopped run can be resumed: finished batches are skipped. In the end the batches are combined into one Seurat object without cell graphs (`pg_data_platelet_cleaned.rds`); the filtered graphs stay on disk in the batch files.
+
+The shared helper functions are in `platelet_cleanup_functions.R`.
+
+> **Decision checkpoint** (clean-up settings)
+> Set `max_contam_fraction`, the memory budget per batch (`memory_budget_gb`) and the segmentation settings in the parameter chunk. Set `run_cleanup <- TRUE` to start the batch run (this can take a long time).
+
+```{r}
+#| label: module02b_setup
+
+library(here)
+here::i_am("pna_3/modules/02b_platelet_cleanup.qmd")
+
+source(here::here("pna_3", "modules", "common_setup.R"))
+source(here::here("pna_3", "modules", "platelet_cleanup_functions.R"))
+
+if (!exists("pg_data", inherits = TRUE)) {
+  pg_data <- load_checkpoint("annotated_seurat_object.rds")
+}
+
+# Protein weights (columns "tcell" and "platelet") and the cell labels they
+# were computed from, both saved by module 02
+w <- load_checkpoint("platelet_tcell_protein_weights.rds")
+# anno_platelet <- load_checkpoint("anno_platelet.rds")
+
+out_dir <- here::here("pna_3", "results", "02b_platelet_cleanup")
+dir.create(
+  file.path(out_dir, "batches"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+```{r}
+# Filter pna data to only tcells
+celltypes_keep <- grep("^CD", pg_data$cell_annotation |> unique(), value = T)
+pg_data <- pg_data |> subset(cell_annotation %in% celltypes_keep)
+pg_data$anno_platelet <- "tcell"
+```
+```{r}
+# pg_data$anno_platelet <- ifelse(
+#   pg_data$tcell_subtype == "Platelets" & pg_data$seurat_clusters %in% c(1, 5),
+#   "platelet",
+#   ifelse(
+#     pg_data$tcell_subtype %in%
+#       c(
+#         "CD8 T FMC63-",
+#         "CD8 T FMC63+",
+#         "CD4 T FMC63-",
+#         "CD4 T FMC63+",
+#         "T other"
+#       ),
+#     "tcell",
+#     "other"
+#   )
+# )
+
+# w <- cc_protein_weights(
+#   pg_data,
+#   group_by = "anno_platelet",
+#   population_1 = "tcell",
+#   population_2 = "platelet"
+# )
+```
+
+## 2b.1. Settings and cells to clean
+
+```{r}
+#| label: module02b_parameters
+
+# Compartment names; must match the columns of the weight matrix
+keep_compartment <- "tcell"
+contam_compartment <- "platelet"
+stopifnot(all(c(keep_compartment, contam_compartment) %in% colnames(w)))
+
+# Cells with a platelet fraction at or above this value are removed
+max_contam_fraction <- 0.2
+# Denominator of the fraction: "umi" (as in the 100-cell test) or "nodes"
+fraction_basis <- "umi"
+
+# Segmentation settings (as in the 100-cell test)
+detect_interface <- TRUE
+min_comp_size <- 50
+
+# Memory that one batch may use, used to set the batch size
+memory_budget_gb <- 8
+
+# Set to TRUE to run the batches. n_max_batches limits the run (e.g. to 2 for a
+# first test); Inf runs everything that is not finished yet.
+run_cleanup <- FALSE
+n_max_batches <- Inf
+
+# T cells to clean, in all samples
+# cells_clean <- intersect(
+#   names(anno_platelet)[anno_platelet == "tcell"],
+#   colnames(pg_data)
+# )
+cells_clean <- colnames(pg_data)
+# table(pg_data$sample_alias[cells_clean])
+```
+
+## 2b.2. Batch size
+
+A pilot set of 100 random T cells is loaded to measure how much memory the cell graphs use per cell (resident memory of the R session before and after loading, since the graphs keep part of their data in C memory that `object.size()` does not count). The batch size is the number of cells that fit in `memory_budget_gb` with a safety factor for the segmented and filtered copies that exist at the same time. Set `batch_size` by hand to override the calibrated value, and check the first batches in the log (`batch_log.csv`) before running everything.
+
+```{r}
+#| label: module02b_calibration
+
+set.seed(analysis_seed)
+pilot_cells <- sample(cells_clean, size = min(100, length(cells_clean)))
+
+bytes_per_cell <- measure_graph_memory(pg_data, pilot_cells)
+calibration <- calibrate_batch_size(
+  bytes_per_cell,
+  memory_budget_gb = memory_budget_gb
+)
+
+message(
+  "Cell graph memory: ",
+  round(calibration$bytes_per_cell / 1e6, 1),
+  " MB per cell. Suggested batch size: ",
+  calibration$batch_size,
+  " cells"
+)
+batch_size <- calibration$batch_size
+```
+
+```{r}
+#| label: module02b_manifest
+
+manifest <- make_batch_manifest(
+  pg_data[[]],
+  cells = cells_clean,
+  batch_size = batch_size
+)
+saveRDS(manifest, file.path(out_dir, "batch_manifest.rds"))
+
+manifest |> count(sample, name = "n_batches")
+```
+
+## 2b.3. Run the batches
+
+Finished batches (all four result files present) are skipped, so this chunk can be rerun after an interruption. Progress per batch is logged to `batch_log.csv`.
+
+```{r}
+#| label: module02b_run_batches
+
+if (run_cleanup) {
+  run_batches(
+    manifest,
+    pg_data,
+    w,
+    out_dir,
+    keep = keep_compartment,
+    contam = contam_compartment,
+    max_contam_fraction = max_contam_fraction,
+    fraction_basis = fraction_basis,
+    detect_interface = detect_interface,
+    min_comp_size = min_comp_size,
+    n_max = n_max_batches
+  )
+} else {
+  message("run_cleanup is FALSE: batches are not run")
+}
+
+# Progress
+manifest |>
+  mutate(
+    done = vapply(batch_id, batch_is_done, logical(1), out_dir = out_dir)
+  ) |>
+  summarise(batches_done = sum(done), batches_total = n())
+```
+
+## 2b.4. Assemble the cleaned object
+
+Runs on the saved batch files only. The cleaned object holds the raw counts of the T cell compartment, the recomputed proximity scores and the QC columns (compartment node counts, platelet fraction, UMI before and after) next to the metadata of the annotated object. The cell graphs are not part of the object; the filtered graphs are in `batches/*_cellgraphs.rds`. The counts are normalised again (CLR, margin 2).
+
+```{r}
+#| label: module02b_assemble
+
+all_done <- all(vapply(
+  manifest$batch_id,
+  batch_is_done,
+  logical(1),
+  out_dir = out_dir
+))
+
+if (all_done) {
+  cleaned <- assemble_cleaned_object(
+    manifest,
+    out_dir,
+    meta = pg_data[[]],
+    assay_name = DefaultAssay(pg_data)
+  )
+  pg_data_clean <- cleaned$object |>
+    NormalizeData(normalization.method = "CLR", margin = 2)
+
+  save_checkpoint("pg_data_platelet_cleaned.rds", pg_data_clean)
+  readr::write_csv(cleaned$qc, file.path(out_dir, "platelet_cleanup_qc.csv"))
+  pg_data_clean
+} else {
+  message("Not all batches are finished: the cleaned object was not assembled")
+}
+```
+
+## 2b.5. Diagnostics
+
+```{r}
+#| label: module02b_diagnostics_load
+
+qc_path <- file.path(out_dir, "platelet_cleanup_qc.csv")
+qc <- if (file.exists(qc_path)) {
+  readr::read_csv(qc_path, show_col_types = FALSE)
+} else {
+  # Fall back to the QC tables of the finished batches
+  bind_rows(lapply(
+    manifest$batch_id[vapply(
+      manifest$batch_id,
+      batch_is_done,
+      logical(1),
+      out_dir = out_dir
+    )],
+    function(id) readRDS(batch_paths(out_dir, id)[["qc"]])
+  ))
+}
+
+# Every cell of the input must be accounted for (kept or removed)
+n_missing <- length(setdiff(cells_clean, qc$component))
+message(
+  nrow(qc),
+  " cells in the QC table, ",
+  n_missing,
+  " of the ",
+  length(cells_clean),
+  " input cells not processed yet"
+)
+```
+
+### 2b.5.1. Platelet fraction and removed cells
+
+```{r}
+#| label: module02b_diagnostics_fraction
+
+qc <- qc |>
+  mutate(sample_alias = sample)
+
+p_fraction <- qc |>
+  filter(status == "ok") |>
+  ggplot(aes(contam_fraction)) +
+  geom_histogram(bins = 50, color = "black", fill = "lightgrey") +
+  geom_vline(xintercept = max_contam_fraction, linetype = "dashed") +
+  facet_wrap(~sample_alias, scales = "free_y") +
+  scale_x_continuous(labels = scales::percent) +
+  theme_bw() +
+  labs(
+    x = "Platelet fraction of cell",
+    y = "Number of cells",
+    caption = glue::glue(
+      "Dashed line: cutoff ({max_contam_fraction}). Cells at or above it are removed."
+    )
+  )
+p_fraction
+export_plot(
+  filename = file.path(out_dir, "platelet_fraction_per_sample"),
+  plot = p_fraction,
+  width = 12,
+  height = 8
+)
+
+qc |>
+  summarise(
+    n_cells = n(),
+    n_removed = sum(!keep_cell),
+    pct_removed = round(100 * mean(!keep_cell), 1),
+    n_segment_error = sum(status != "ok"),
+    .by = sample_alias
+  ) |>
+  arrange(sample_alias)
+```
+
+### 2b.5.2. Signal retained per cell
+
+Fraction of the UMIs and of the nodes that is kept for the cells that pass the filter. Nodes labelled `other` (unclassified) and `interface` are dropped together with the platelet patches, so a large loss in cells without platelet patches would indicate that the `tcell` compartment is too strict.
+
+```{r}
+#| label: module02b_diagnostics_retained
+
+p_retained <- qc |>
+  filter(keep_cell) |>
+  mutate(
+    umi_retained = n_umi_after / n_umi_before,
+    has_patches = n_patches > 0
+  ) |>
+  ggplot(aes(sample_alias, umi_retained, color = has_patches)) +
+  ggbeeswarm::geom_quasirandom(size = 0.5, dodge.width = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = "",
+    y = "UMIs retained",
+    color = "Platelet\npatches\ndetected"
+  )
+p_retained
+export_plot(
+  filename = file.path(out_dir, "umi_retained_per_sample"),
+  plot = p_retained,
+  width = 9,
+  height = 5
+)
+
+qc |>
+  filter(keep_cell) |>
+  summarise(
+    across(
+      c(n_nodes_keep, n_nodes_contam, n_nodes_interface, n_nodes_other),
+      \(x) round(100 * sum(x) / sum(n_nodes), 1)
+    ),
+    .by = sample_alias
+  ) |>
+  rename_with(\(x) paste0("pct_", x), starts_with("n_nodes"))
+```
+
+### 2b.5.3. Colocalization before and after clean-up
+
+Unfinished test from the 100-cell run: compare colocalization of the cleaned cells with the original data. It needs `pg_data_clean` and the original proximity scores of the same cells before it can be used.
+
+```{r}
+#| label: module02b_coloc_after
+#| eval: false
+
+metadata_col_keep <- c("sample_alias", "donor", "timepoint", "tcell_subtype")
+# After platelet clean-up
+prox_dat_noplat <- ProximityScores(
+  pg_data_clean,
+  lazy = FALSE,
+  meta_data_columns = metadata_col_keep
+) |>
+  collect()
+
+summary_proximity_data_noplat <- SummarizeProximityScores(
+  prox_dat_noplat,
+  group_vars = c("sample_alias")
+)
+
+samples <- pg_data_clean$sample_alias |> unique() |> as.character() |> sort()
+p_list_filt <- lapply(samples, function(s) {
+  ColocalizationHeatmap(
+    summary_proximity_data_noplat |> filter(sample_alias == s),
+    marker1_col = "marker_1",
+    marker2_col = "marker_2",
+    value_col = "mean_log2_ratio",
+    size_col = "pct_detected",
+    type = "dots",
+    size_range = c(0, 1),
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    legend_range = c(-1, 1)
+  ) +
+    labs(title = s) +
+    theme(axis.text = element_text(size = 6))
+})
+
+export_plot(
+  filename = file.path(out_dir, "prox_scores_per_sample_after_cleanup"),
+  plot = patchwork::wrap_plots(p_list_filt, nrow = 4),
+  width = 50,
+  height = 40
+)
+```
+
+```{r}
+#| label: module02b_coloc_before
+#| eval: true
+
+metadata_col_keep <- c("sample_alias", "donor", "timepoint", "tcell_subtype")
+# After platelet clean-up
+prox_dat_orig <- ProximityScores(
+  pg_data,
+  lazy = TRUE,
+  meta_data_columns = metadata_col_keep
+) |>
+  collect()
+
+summary_proximity_data_orig <- SummarizeProximityScores(
+  prox_dat_orig,
+  group_vars = c("sample_alias")
+)
+
+samples <- pg_data$sample_alias |> unique() |> as.character() |> sort()
+p_list_filt <- lapply(samples, function(s) {
+  ColocalizationHeatmap(
+    summary_proximity_data_orig |> filter(sample_alias == s),
+    marker1_col = "marker_1",
+    marker2_col = "marker_2",
+    value_col = "mean_log2_ratio",
+    size_col = "pct_detected",
+    type = "dots",
+    size_range = c(0, 1),
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    legend_range = c(-1, 1)
+  ) +
+    labs(title = s) +
+    theme(axis.text = element_text(size = 6))
+})
+
+export_plot(
+  filename = file.path(out_dir, "prox_scores_per_sample_before_cleanup"),
+  plot = patchwork::wrap_plots(p_list_filt, nrow = 4),
+  width = 50,
+  height = 40
+)
+```
+
+
+
+```{r}
+#| label: module02b_coloc_selected_markers
+#| eval: true
+
+samples <- pg_data$sample_alias |> unique() |> as.character() |> sort()
+
+selected_markers <- c(
+  "ADAM10",
+  "CD29",
+  "CD37",
+  "CD3E",
+  "CD43",
+  "CD44",
+  "CD45",
+  "CD48",
+  "CD52",
+  "CD53",
+  "CD59",
+  "CD81",
+  "CD82",
+  "FMC63",
+  "HLA-ABC",
+  "HLA-DR-DP-DQ",
+  "CD41",
+  "CD9",
+  "ICAM-2",
+  "CD62P",
+  "CD36",
+  "DNAM-1"
+)
+
+p_list_filt_before <- lapply(samples, function(s) {
+  ColocalizationHeatmap(
+    summary_proximity_data_orig |>
+      filter(
+        sample_alias == s &
+          marker_1 %in% selected_markers &
+          marker_2 %in% selected_markers
+      ),
+    marker1_col = "marker_1",
+    marker2_col = "marker_2",
+    value_col = "mean_log2_ratio",
+    size_col = "pct_detected",
+    type = "dots",
+    size_range = c(0, 2),
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    legend_range = c(-1, 1)
+  ) +
+    labs(title = s) +
+    theme(axis.text = element_text(size = 6))
+})
+
+p_list_filt_after <- lapply(samples, function(s) {
+  ColocalizationHeatmap(
+    summary_proximity_data_noplat |>
+      filter(
+        sample_alias == s &
+          marker_1 %in% selected_markers &
+          marker_2 %in% selected_markers
+      ),
+    marker1_col = "marker_1",
+    marker2_col = "marker_2",
+    value_col = "mean_log2_ratio",
+    size_col = "pct_detected",
+    type = "dots",
+    size_range = c(0, 2),
+    cluster_cols = TRUE,
+    cluster_rows = TRUE,
+    legend_range = c(-1, 1)
+  ) +
+    labs(title = s) +
+    theme(axis.text = element_text(size = 6))
+})
+
+
+export_plot(
+  filename = file.path(
+    out_dir,
+    "prox_scores_per_sample_selected_markers_before_cleanup"
+  ),
+  plot = patchwork::wrap_plots(p_list_filt_before, nrow = 4),
+  width = 20,
+  height = 16
+)
+
+export_plot(
+  filename = file.path(
+    out_dir,
+    "prox_scores_per_sample_selected_markers_after_cleanup"
+  ),
+  plot = patchwork::wrap_plots(p_list_filt_after, nrow = 4),
+  width = 20,
+  height = 16
+)
+```
