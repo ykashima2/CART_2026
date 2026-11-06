@@ -1,0 +1,4895 @@
+---
+title: "Suzuki -- CAR-T clinical study -- Preprocessing, UPDATED with CD4/CD8 gating"
+subtitle: "Pixelgen MPX data analysis"
+author: "Lovisa Franzén"
+date: "2026-09-30"
+output: html_document
+format:
+  html:
+    theme: default
+    page-layout: full
+    code_folding: show
+    embed-resources: true
+    toc: true
+    toc-location: right
+    toc-depth: 5
+---
+
+# Details
+
+Original processing done 2025-09-30. New updates applied 2026-09-30.
+
+Study led by Prof. Suzuki Yutaka and Dr. Kashima Yukie (Tokyo University, Japan). Product used: Molecular Pixelation (MPX) assay.
+
+**Purpose.** This notebook processes all samples of the first MPX batch (batch 1). After joint QC and cell filtering, three data sets are processed separately and saved for downstream analyses: (1) all samples, (2) only t0/t1 samples, and (3) only donor 32 (timecourse). Each data set goes through CLR normalisation, dimensionality reduction, integration, clustering, and cell type annotation (cluster-based, refined for T cells by marker gating and FMC63 status).
+
+**Data.** Eight samples from three donors (32, 44, 50) who received CAR-T treatment: the CAR-T product before infusion (t0) and PBMC collected days post infusion (DPI; t1-t3). Data are read from `mpx/data` (`DIR_DATA`), with sample information from `sample_metadata.tsv`.
+
+| Sample ID      | Donor    | Sample type   | DPI | Timepoint | PXL file                          |
+|:---------------|:---------|:--------------|:---:|:---------:|:----------------------------------|
+| TKB_CAR-T_64   | donor_32 | CAR-T product | d00 | t0        | TKB_CAR-T_64.layout.dataset.pxl   |
+| TKB_CAR-T_73   | donor_32 | PBMC          | d08 | t1        | TKB_CAR-T_73.layout.dataset.pxl   |
+| TKB_CAR-T_79   | donor_32 | PBMC          | d13 | t2        | TKB_CAR-T_79.layout.dataset.pxl   |
+| TKB_CAR-T_84   | donor_32 | PBMC          | d24 | t3        | TKB_CAR-T_84.layout.dataset.pxl   |
+| TKB_CAR_T_95   | donor_44 | CAR-T product | d00 | t0        | TKB_CAR_T_95.layout.dataset.pxl   |
+| TKB_CAR_T_97   | donor_44 | PBMC          | d08 | t1        | TKB_CAR_T_97.layout.dataset.pxl   |
+| TKB_CAR_T_105  | donor_50 | CAR-T product | d00 | t0        | TKB_CAR_T_105.layout.dataset.pxl  |
+| TKB_CAR_T_112  | donor_50 | PBMC          | d09 | t1        | TKB_CAR_T_112.layout.dataset.pxl  |
+
+**Quality control and filtering.** Cells (components) are kept if they pass all of the following:
+
+| Setting                    | Cutoff              | Parameter                              |
+|:---------------------------|:--------------------|:---------------------------------------|
+| Molecules per component    | 10,000-100,000      | `umi_cutoff_low`, `umi_cutoff_high`    |
+| Top N components by rank   | none                | -                                      |
+| Tau type                   | normal              | -                                      |
+| Isotype control percentage | < 1% of molecules   | `isotype_cutoff`                       |
+| ACTB percentage            | <= 1% of molecules  | `actb_pct_cutoff`                      |
+
+The isotype controls (mIgG1, mIgG2a, mIgG2b) and ACTB are removed from the marker panel after filtering.
+
+**FMC63 status.** Two FMC63 status columns are created:
+
+- `FMC63_status` (counts): FMC63 count >= 5 → "FMC63+" (`fmc63_cutoff`).
+- `FMC63_status_clr` (CLR, used for annotation; computed per data set after normalisation): FMC63 CLR >= 1.5 at t0 (`fmc63_cutoff_clr_t0`) and >= 0 at t1-t3 (`fmc63_cutoff_clr`) → "FMC63+", otherwise "FMC63-".
+
+**Processing.** Each data set is CLR-normalised (`NormalizeMPX(method = "clr")`) and scaled (`ScaleData()`) on its own. PCA is followed by a UMAP, the PCs are integrated with Harmony by `sample` (`integrate_by`), and a second UMAP and the clusters (`FindNeighbors` / `FindClusters`) are computed on the Harmony dimensions:
+
+| Data set             | Samples                 | PCs / Harmony dims (`n_dims`) | Cluster resolution (`cluster_res`) | Output object                                   |
+|:---------------------|:------------------------|:-----------------------------:|:----------------------------------:|:------------------------------------------------|
+| All samples          | all 8                   | 15                            | 0.5                                | `robj_suzuki_cart_processed_data_all.rds`       |
+| T1 vs T0             | t0 and t1 (6)           | 15                            | 0.5                                | `robj_suzuki_cart_processed_data_t0t1.rds`      |
+| Timecourse: Donor 32 | donor_32, t0-t3 (4)     | 14                            | 0.4                                | `robj_suzuki_cart_processed_data_d32.rds`       |
+
+**Annotation.** In each data set, clusters are first annotated manually from their marker proteins:
+
+- All samples: 0 → CD4 T; 6 → CD4 T FMC63hi; 2, 7, 9 → CD8 T; 1 → CD8 T FMC63hi; 8 → Other T; 11 → NK; 4, 5, 13 → Platelets; 3, 10, 12 → Myeloid.
+- T1 vs T0: 0 → CD4 T; 3 → CD4 T FMC63hi; 2, 6, 9 → CD8 T; 4 → CD8 T FMC63hi; 8 → Other T; 10 → NK; 1, 7, 11 → Platelets; 5 → Myeloid.
+- Donor 32: 6 → CD4 T; 0 → CD4 T FMC63hi; 5 → CD8 T; 1, 3 → CD8 T FMC63hi; 8 → Other T; 2 → Platelets; 4, 7 → Myeloid.
+
+Clusters 7 (all samples) and 5 (donor 32) contain both CD8 T cells and cells previously annotated as NK, and are annotated as CD8 T; the gating below then labels each cell by its CD3E, CD4 and CD8 levels. In the all-samples data set most of the previously NK-annotated cells in cluster 7 are CD3E+ CD4- CD8-low and are gated as "Other T"; in the donor 32 data set they are CD3E-low and become "other", so NK cells have no label of their own there. The previous mappings, used for the objects saved on 2025-10-02, are kept as comments in the annotation code.
+
+Cells in the CD4 and CD8 T cell clusters are then re-annotated by marker gating on CLR values (`cutoff_cd3`, `cutoff_cd4`, `cutoff_cd8`), giving the final `celltype` column:
+
+- CD3E > 1, CD4 > 1 and CD8 < 2 → CD4 T; CD3E > 1, CD4 < 1 and CD8 > 2 → CD8 T. Both are split by FMC63 status: "CD4 T FMC63+" and "CD8 T FMC63+", while FMC63- cells are labelled "CD4 T" and "CD8 T".
+- Any other CD3E > 1 cell, i.e. CD4- CD8- (double negative) or CD4+ CD8+ (double positive) → "Other T".
+- CD3E <= 1 cells in the CD4/CD8 T cell clusters → "other".
+- Cells in all other clusters (Other T, NK, Myeloid, Platelets) keep their cluster label.
+
+`celltype_broad` is the same annotation without the FMC63 status.
+
+The cutoff values in this section match the parameters set in the code below. If a cutoff is changed in the code, update this section too.
+
+**Outputs.** Figures are written to `mpx/results/qc/` and `mpx/results/processed/`. The three processed objects are saved in `mpx/rdata/` (see the table above). The filtered, unprocessed object `mpx/rdata/robj_suzuki_cart_data_combined_filt.rds` is only written if its chunk is run manually (`eval: false`).
+
+\
+
+
+# Setup
+
+## Libraries, parameters, and functions
+
+```{r general_def}
+#| code-fold: true
+set.seed(1)
+here::i_am("mpx/scripts/01_processing_all_gating.qmd")
+
+png_res <- 300
+```
+
+```{r}
+#| code-fold: true
+#| output: false
+
+fn_sources <- list.files(
+  here::here("mpx", "scripts", "R"),
+  pattern = "*.R$",
+  full.names = TRUE
+)
+
+sapply(fn_sources, source, .GlobalEnv)
+```
+
+```{r}
+#| code-fold: true
+# All packages used in this notebook are loaded here.
+# If a package is missing, install it first, e.g. install.packages("ggalluvial")
+load_packages(
+  c(
+    "dplyr",
+    "tidyr",
+    "ggplot2",
+    "patchwork",
+    "pixelatorR",
+    "Seurat",
+    "readr",
+    "ggrepel",
+    "harmony",
+    "here",
+    "stringr",
+    "tibble",
+    "ComplexHeatmap",
+    "glue",
+    "conflicted",
+    "gt",
+    "ggalluvial"
+  )
+)
+
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+```
+
+Colour palettes, plot themes and `display_dt()` come from `mpx/scripts/R/custom_themes_colors.R`, which is sourced above.
+
+\
+
+## Read data
+
+```{r}
+DIR_DATA <- here::here("mpx", "data")
+```
+
+### Sample metadata
+
+```{r}
+mdat_df <- read.table(
+  file.path(DIR_DATA, "sample_metadata.tsv"),
+  sep = "\t",
+  header = T
+)
+knitr::kable(mdat_df, "simple")
+```
+
+\
+
+
+```{r}
+names(pal_donor) <- mdat_df$donor |> unique()
+names(pal_samples) <- mdat_df$sample |> unique()
+```
+
+
+### PXL data
+
+```{r}
+#' Fetch paths for the PXL files
+pxl_files <- list.files(
+  file.path(DIR_DATA),
+  pattern = "pxl",
+  full.names = TRUE,
+  recursive = T
+)
+```
+
+```{r}
+#' Add the sample name to the file paths
+samples <- sapply(1:nrow(mdat_df), function(i) {
+  sample_name <- mdat_df$sample[i]
+  file <- grep(sample_name, pxl_files, ignore.case = TRUE, value = TRUE)
+  setNames(file, sample_name)
+})
+```
+
+```{r}
+#' Read in the PXL data into a list using the `ReadMPX_Seurat()` function, one-by-one
+data <- lapply(
+  samples,
+  ReadMPX_Seurat,
+  load_polarity_scores = TRUE,
+  load_colocalization_scores = TRUE,
+  return_cellgraphassay = TRUE
+)
+
+#' Create a merged object, where we have all data in a joint object
+data_combined <- merge(
+  data[[1]],
+  y = data[-1],
+  add.cell.ids = names(data)
+) |>
+  SeuratObject::JoinLayers()
+
+#' Add sample metadata to the combined object
+mdata_add <- data.frame(
+  component = colnames(data_combined)
+) |>
+  mutate(sample = sub("(.{0,17})_.*", "\\1", component)) |>
+  merge(y = mdat_df, by = "sample")
+
+rownames(mdata_add) <- mdata_add$component
+
+data_combined <- Seurat::AddMetaData(data_combined, metadata = mdata_add)
+
+
+data_combined[[]] <- data_combined[[]] |>
+  group_by(sample) |>
+  mutate(rank = rank(-molecules, ties.method = "random"))
+
+# data_combined  <- data_combined |> subset(rank < 2000) # If we want to filter cells based on rank, and select the 2000 component with the most molecules
+```
+
+```{r}
+#' Format the sample name column as a factor with levels in the order of donor
+sample_order <- mdat_df |> pull(sample)
+data_combined$sample <- factor(data_combined$sample, levels = sample_order)
+```
+
+\
+
+# Quality control
+
+## Visualization
+
+To start, let's visualize what the data looks like.
+
+```{r}
+knitr::kable(head(data_combined@meta.data), "simple")
+```
+
+```{r fig.width=12, fig.height=6}
+edgerank_plot <- MoleculeRankPlot(data_combined, group_by = "sample")
+p <- edgerank_plot +
+  geom_hline(
+    yintercept = c(5e3, 10e3, 15e3, 20e3, 80e3, 100e3, 200e3),
+    linetype = "dashed",
+    linewidth = 0.2
+  ) +
+  geom_hline(yintercept = c(18e3), linetype = "dashed", colour = "red") +
+  scale_color_manual(values = pal_samples) +
+  facet_wrap(~sample, ncol = 4)
+p
+
+pdf(here("mpx", "results", "qc", "qc_rank_plot.pdf"), width = 12, height = 6)
+p
+dev.off()
+```
+
+*Black dashed lines correspond to 5 000, 10 000, 15 000, 20 000, 80 000, 100 000, and 200 000. Red dashed line correspond to 18 000.*
+
+For filtering the data, we want to set the cutoff where the curve becomes the steepest. The curve shape differs quite a bit between samples and donors. If we were to analyze the donor samples separately, I'd aim to put a cutoff for donor 32 at 15000, while for donors 44 and 50 I'd put it at 20000. If we are to set a common cutoff for all samples, I'd opt for the 15000 cutoff, although we can be a bit more relaxed and set it to 10000, to not remove too many components from donor 32. I saw that in your (Yuki's) analysis, the cutoff was set to 5000, with a note that 10000 was too strict, but from seeing these curves that is definitely not my impression. We need to ensure we discard enough of the components that have too few molecules in them, or else we'll end up with datasets that are diluted by poor-quality cells.
+
+For one sample, TKB_CAR_T_97, we also have a lot of component with very high molecule counts. It'd be reasonable to also filter some of these away by setting an upper cutoff. If we are to only remove the top components in this particular sample, setting the max cutoff to 200k would do the job. If we however also want to remove components with very high molecule counts across all samples and end up with more similar profiles for all the samples, we can lower this cutoff to 100k.
+
+One sample that appears to stand out a bit quality-wise is the TKB-CAR-T_84 sample (donor 32, dpi 24), so it'll be good to keep an eye out for this sample in the downstream QC, filtering, and processing.
+
+\
+
+Next, we can look at some of the typical QC metrics and their distributions in the samples. In addition to the metrics already available in the object metadata, we can also compute the cellular molecule fraction of the isotype control antibodies, as we have seen a correlation between elevated isotype control fraction (isotype percentage \> 1-5%) and poorer cell quality.
+
+```{r}
+isotype_controls <- c("mIgG1", "mIgG2a", "mIgG2b")
+data_combined[["isotype_total"]] <- FetchData(
+  data_combined,
+  vars = isotype_controls,
+  layer = "counts"
+) |>
+  rowSums()
+data_combined[["isotype_fraction"]] <- data_combined[["isotype_total"]] /
+  data_combined[["molecules"]]
+data_combined[["isotype_pct"]] <- data_combined[["isotype_fraction"]] * 100
+```
+
+```{r fig.width=12, fig.height=10}
+p <- data_combined[[]] %>%
+  select(
+    sample,
+    donor,
+    timepoint,
+    molecules,
+    mean_molecules_per_a_pixel,
+    reads,
+    mean_reads_per_molecule,
+    isotype_pct
+  ) %>%
+  pivot_longer(
+    cols = c(
+      "molecules",
+      "mean_molecules_per_a_pixel",
+      "reads",
+      "mean_reads_per_molecule",
+      "isotype_pct"
+    ),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(sample, value, fill = donor)) +
+  geom_violin(draw_quantiles = 0.5) +
+  scale_fill_manual(values = pal_donor) +
+  facet_grid(metric ~ ., scales = "free") +
+  scale_y_log10() +
+  theme_linedraw()
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_metrics_violins.pdf"),
+  width = 12,
+  height = 10
+)
+p
+dev.off()
+```
+
+Here, we can see that the metrics differ a bit based on donor, timepoint, and sample type (CAR-T product or PBMC sample), which is not too surprising. Especially the difference in sample type will play a very big role for QC metrics in terms of e.g cell type composition. We can also see that the sample TKB-CAR-T_84 differ quite a bit from the other PBMC samples.
+
+Next, we can also inspect the Tau metric, giving us insight about any potential antibody aggregates in cells.
+
+```{r fig.width=15, fig.height=10}
+p <- TauPlot(data_combined, group_by = "sample")
+p
+pdf(here("mpx", "results", "qc", "qc_tau_plot.pdf"), width = 15, height = 10)
+p
+dev.off()
+```
+
+When filtering, we will only keep components that have the 'normal' Tau type.
+
+\
+
+Since we also have the FMC63 marker in the panel, we can have a look at the raw count levels of FMC63 across the samples. Since the values can be very small, we can plot it on a log10 scale to better appreciate the abundance levels across samples.
+
+```{r fig.width=8, fig.height=4}
+p1 <- VlnPlot(
+  data_combined,
+  features = "FMC63",
+  group.by = "type",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  theme_violin() &
+  # geom_hline(yintercept = 0, linewidth = 0.25) &
+  geom_hline(
+    yintercept = c(0.5, 1, 1.5, 5, 10, 25, 50),
+    linewidth = 0.25,
+    linetype = "dashed"
+  ) &
+  scale_y_log10() &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 counts (log10 scale)")
+
+p2 <- VlnPlot(
+  data_combined,
+  features = "FMC63",
+  group.by = "type",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  theme_violin() &
+  geom_hline(
+    yintercept = c(5, 10, 20, 50, 100),
+    linewidth = 0.25,
+    linetype = "dashed"
+  ) &
+  labs(y = "FMC63 counts")
+
+p <- p1 | p2
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_marker_fmc63_violin.pdf"),
+  width = 8,
+  height = 4
+)
+p
+dev.off()
+```
+
+Here, we can see that FMC63 is mainly being captured in the pure CAR-T samples, which makes sense. For the PBMC samples, we have a very clear bimodal distribution, where the positive cells captured likely corresponds to the captured CAR-T cells in the PBMC samples.
+
+In the pure CAR-T samples, we can also see that some cells appear negative for FMC63. If we want, for future downstream processing, we could exclude these cells from these particular samples to ensure that we only work with FMC63+ cells. But, we don't know exactly the reason for the lack of FMC63 in these cells, it might just present a background level of cells where we don't capture this marker.
+
+
+We can also plot the FMC63 data in density plots for the CAR-T product samples
+```{r fig.width=4, fig.height=8}
+# create a new assay to store the logged count information
+logged_cts <- log1p(GetAssayData(
+  data_combined,
+  assay = "mpxCells",
+  layer = "counts"
+))
+log_assay <- CreateAssay5Object(data = logged_cts)
+data_combined[["log_assay"]] <- log_assay
+DefaultAssay(data_combined) <- "log_assay"
+
+p <- DensityScatterPlot(
+  subset(data_combined, type == "CAR-T_product"),
+  marker1 = "CD3E",
+  marker2 = "FMC63",
+  # margin_density = TRUE,
+  facet_vars = "sample"
+) &
+  geom_hline(yintercept = 4)
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_density_plot_fmc63.pdf"),
+  width = 4,
+  height = 8
+)
+p
+dev.off()
+
+DefaultAssay(data_combined) <- "mpxCells"
+```
+
+
+```{r}
+data_combined[["FMC63_count"]] <- FetchData(
+  data_combined,
+  vars = "FMC63",
+  layer = "counts"
+)
+```
+
+If we set the FMC63 count cutoff at 0.5, we can see from the plot above that we are clearly separating the positive from the negative cells. 
+Let's define positive cells as having an FMC63 count of 5 or more.
+
+
+```{r}
+fmc63_cutoff <- 5
+data_combined[[]] <- data_combined[[]] |>
+  mutate(FMC63_status = ifelse(FMC63_count >= fmc63_cutoff, "FMC63+", "FMC63-"))
+```
+
+```{r}
+fmc_sample_status <- data_combined[[]] |>
+  group_by(sample, FMC63_status) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  merge(mdat_df, by = "sample")
+fmc_sample_status
+```
+We can make a plot, similar to the one included in the suggested Fig 3E, showing the proportion of FMC63+ cells across timepoints (but here for all the cells, so not subsetting T cells)
+
+```{r fig.width=6, fig.height=2}
+p <- ggplot(
+  fmc_sample_status |>
+    filter(FMC63_status == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(x = timepoint, y = pct, color = donor, group = donor)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = pal_donor) +
+  labs(y = "Fraction of\nFMC63+ cells (%)") +
+  ylim(0, 100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "none",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_fmc63_pct_line.pdf"),
+  width = 6,
+  height = 2
+)
+p
+dev.off()
+```
+
+Or we can have a look at the total FMC63 counts per sample:
+
+```{r fig.width=6, fig.height=2}
+fmc_sum <- data_combined[[]] |>
+  group_by(sample) |>
+  summarize(n_cells = n(), levels = sum(FMC63_count)) |>
+  merge(mdat_df, by = "sample")
+
+p <- ggplot(
+  fmc_sum,
+  aes(x = timepoint, y = levels, color = donor, group = donor)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = pal_donor) +
+  labs(y = "Total FMC63 counts\n(MPX)") +
+  # ylim(0,100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "none",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_fmc63_count_line.pdf"),
+  width = 6,
+  height = 2
+)
+p
+dev.off()
+```
+
+
+
+Compare with ddPCR results of CAR levels in samples:
+
+```{r fig.width=6, fig.height=2}
+ddpcr <- data.frame(
+  sample = mdat_df$sample,
+  donor = mdat_df$donor,
+  timepoint = mdat_df$timepoint,
+  levels = c(66.02, 52.52, 9.506, 3.076, NA, 16.742, 72.4, 17.62)
+)
+# ddpcr
+
+p <- ggplot(
+  ddpcr,
+  aes(x = timepoint, y = levels, color = donor, group = donor)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = pal_donor) +
+  labs(y = "FMC63 levels\nby ddPCR") +
+  # ylim(0,100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "none",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_fmc63_ddPCR_line.pdf"),
+  width = 6,
+  height = 2
+)
+p
+dev.off()
+```
+
+
+\
+
+We can also have a look at the ACTB abundance levels. Here, ACTB is also used as a type of control since it is only supposed to be present inside of the cells. Components with a very high fraction of ACTB abundance might therefore correspond to highly permeabilized or damaged/dying cells.
+
+```{r}
+data_combined[["actb_total"]] <- FetchData(
+  data_combined,
+  vars = "ACTB",
+  layer = "counts"
+)
+data_combined[["actb_fraction"]] <- data_combined[["actb_total"]] /
+  data_combined[["molecules"]]
+data_combined[["actb_pct"]] <- data_combined[["actb_fraction"]] * 100
+```
+
+```{r fig.width=8, fig.height=5}
+p <- VlnPlot(
+  data_combined,
+  features = c("actb_pct", "isotype_pct"),
+  group.by = "sample",
+  split.by = "sample",
+  pt.size = 0.5,
+  cols = pal_samples
+) &
+  theme_violin() &
+  geom_hline(
+    yintercept = c(0, 1, 5, 10),
+    linetype = "dashed",
+    linewidth = 0.25
+  ) &
+  NoLegend()
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_actb_isotype_pct_violin.pdf"),
+  width = 8,
+  height = 5
+)
+p
+dev.off()
+```
+
+```{r}
+data_combined[[]] |>
+  mutate(actb_high = ifelse(actb_pct > 1, "high", "low")) |>
+  group_by(sample, actb_high) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3))
+```
+
+We have a very very low fraction of cells that have increased ACTB content (0.001%-0.01%), when looking at cells with more than 1% molecule counts corresponding to ACTB counts. To be on the safe side, and not risk having any of these cells affect our downstream processing, we can also exclude them for the analysis.
+
+\
+
+Let's also have a look at a few other markers and plot their abundances across samples.
+
+```{r fig.width=10, fig.height=4}
+p <- VlnPlot(
+  data_combined,
+  features = c("CD19", "CD3E"),
+  group.by = "type",
+  split.by = "sample",
+  pt.size = 0.1,
+  cols = pal_samples
+) &
+  theme_violin() &
+  # geom_hline(yintercept = 0, linewidth = 0.25) &
+  geom_hline(yintercept = c(0.5, 1, 1.5), linewidth = 0.25, linetype = "dashed")
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_marker_CD19_CD3E_violin.pdf"),
+  width = 10,
+  height = 4
+)
+p
+dev.off()
+```
+```{r fig.width=3, fig.height=5}
+DefaultAssay(data_combined) <- "log_assay"
+
+pdf(
+  here("mpx", "results", "qc", "qc_density_plot_t_b_cell_markers.pdf"),
+  width = 4,
+  height = 8
+)
+#' T cells
+p1 <- DensityScatterPlot(
+  data_combined,
+  marker1 = "CD3E",
+  marker2 = "CD4",
+  facet_vars = "type"
+)
+p1
+
+p2 <- DensityScatterPlot(
+  data_combined,
+  marker1 = "CD3E",
+  marker2 = "CD8",
+  facet_vars = "type"
+)
+p2
+
+p3 <- DensityScatterPlot(
+  data_combined,
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "type"
+)
+p3
+
+#' B cells
+p4 <- DensityScatterPlot(
+  data_combined,
+  marker1 = "CD19",
+  marker2 = "CD20",
+  facet_vars = "type"
+)
+p4
+dev.off()
+
+p1
+p2
+p3
+p4
+
+DefaultAssay(data_combined) <- "mpxCells"
+```
+
+Here we also see that while we have clear T cell populations, there seems to be more or less no B cells captured in the PBMC population.
+
+\
+
+## Filtering
+
+Components are kept if they have 10,000-100,000 molecules, a normal tau type, less than 1% of their molecules from isotype control antibodies, and at most 1% of their molecules from ACTB.
+
+The upper molecule cutoff removes components with very high molecule counts, which may correspond to cell doublets.
+
+```{r}
+umi_cutoff_low <- 10e3 # Only keep cell with more than 10,000 molecules per component
+umi_cutoff_high <- 100e3 # Only keep cell with less than 100,000 molecules per component
+isotype_cutoff <- 1 # Only keep cells with less than 1% isotype controls detected
+actb_pct_cutoff <- 1 # Only keep cells with less than 1% ACTB count content detected
+
+components_keep <- data_combined[[]] |>
+  mutate(
+    molecule_normal = case_when(
+      molecules >= umi_cutoff_low & molecules <= umi_cutoff_high ~ TRUE,
+      molecules < umi_cutoff_low | molecules > umi_cutoff_high ~ FALSE
+    )
+  ) |>
+  filter(
+    molecule_normal == TRUE,
+    tau_type == "normal",
+    isotype_pct < isotype_cutoff, # corrected: used to be "isotype_fraction < 1", i.e. 100%
+    actb_pct <= actb_pct_cutoff,
+  ) |>
+  select(sample, molecule_normal) |>
+  rownames()
+
+data_combined_filt <- data_combined |> subset(cells = components_keep)
+```
+
+
+
+Let's inspect how many cells we have left after filtering the data using our specified cutoffs.
+
+```{r fig.width=4, fig.height=4}
+p <- CellCountPlot(data_combined_filt, color_by = "sample") &
+  scale_fill_manual(values = pal_samples) &
+  labs(fill = "") &
+  theme_linedraw(base_size = 14) +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      legend.position = "none"
+    )
+p
+
+pdf(
+  here("mpx", "results", "qc", "qc_post_filter_ncells_sample.pdf"),
+  width = 4,
+  height = 4
+)
+p
+dev.off()
+```
+
+We can also perform filtering of the markers, and specifically, we may want to remove the isotype control antibodies from the data so that their levels are not driving separation between the cells. (Alternatively, you can keep these and use them either for dsb normalization or for regression during scaling: `ScaleData(vars.to.regress="isotype_pct")`, to regress out any minor effects the isotype fractions might have on the abundance levels).   
+
+```{r}
+all_markers <- rownames(data_combined_filt)
+markers_keep <- all_markers[!all_markers %in% c(isotype_controls, "ACTB")]
+
+message(glue(
+  "For the downstream analysis we will keep ",
+  length(markers_keep),
+  " markers: ",
+  paste(sort(markers_keep), collapse = ", ")
+))
+
+# Filter
+data_combined_filt <- subset(data_combined_filt, features = markers_keep)
+```
+```{r}
+# New data
+data_combined_filt
+```
+
+Now that the abundance data has been filtered, we can proceed with the downstream processing of the samples.
+
+
+```{r}
+#| eval: false
+
+#' Save final R object(s)
+saveRDS(
+  data_combined_filt,
+  file = here("mpx", "rdata", "robj_suzuki_cart_data_combined_filt.rds")
+)
+
+#' Save entire workspace (for reproducibility in case something needs to be replotted)
+# save.image(here("mpx", "rdata", "workspace_suzuki_cart_script01_2025-06-xx.RData"))
+```
+
+
+```{r}
+#' Clean up objects
+rm(data)
+rm(data_combined)
+rm(edgerank_plot)
+```
+
+
+\
+
+# Data processing
+
+The data processing includes abundance normalization, dimensionality reduction, data integration, and clustering, followed by cell type annotation.
+
+We can split up the processing into several workflows, starting with working with all the 8 samples at the same time. Thereafter, we can also perform the processing on e.g. a per-donor basis, or some other approach. Here's a list of some different options:
+
+-   Process all 8 samples jointly
+-   Process d32 samples separately -- Study temporal effects of CAR-T infusion
+-   Process t0 and t1 samples separately (from all three donors) -- Study effect on CAR-T cells before/after infusion
+-   (Optional) Process d32 / d44 / d50 separately -- Only look at donor effects and then compare overlapping results between analyses. This approach should hopefully not be needed if the other approaches works well and the data looks well integrated
+
+
+Depending on how you want to phrase the story in the manuscript, we can go for different approaches. For instance, one way to phrase it could be to first present the t1 vs t1 data and make a fully focused analysis around the FMC63+ cells and how they have changed before/after infusion. This could be followed by the time course data, where FMC63+ cells can be tracked over time and as well as studying the temporal dynamics of the other cell populations in response to presence of FMC63+ cells.
+
+\
+
+## All samples
+
+Let's start by processing all the samples at once, and see how well the samples and donors integrate.
+
+```{r}
+data_all <- data_combined_filt
+```
+
+\
+
+### CLR normalization
+
+First, we'll normalize all the data jointly using the CLR approach.
+
+```{r}
+data_all <- data_all |>
+  NormalizeMPX(method = "clr") |>
+  ScaleData()
+```
+
+\
+
+### Figures
+
+We can generate a few descriptive figures of the normalized and scaled data.
+
+```{r fig.width=15, fig.height=5}
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_density_plot_fmc_t_b_cell_markers.pdf"
+  ),
+  width = 4,
+  height = 8
+)
+#' T cells
+p1 <- DensityScatterPlot(
+  data_all,
+  marker1 = "CD3E",
+  marker2 = "CD4",
+  facet_vars = "type",
+  layer = "data"
+)
+p1
+
+p2 <- DensityScatterPlot(
+  data_all,
+  marker1 = "CD3E",
+  marker2 = "CD8",
+  facet_vars = "type",
+  layer = "data"
+)
+p2
+
+p3 <- DensityScatterPlot(
+  data_all,
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "type",
+  layer = "data"
+)
+p3
+
+p4 <- DensityScatterPlot(
+  data_all,
+  marker1 = "CD3E",
+  marker2 = "FMC63",
+  facet_vars = "type",
+  layer = "data"
+)
+p4
+
+#' B cells
+p5 <- DensityScatterPlot(
+  data_all,
+  marker1 = "CD19",
+  marker2 = "CD20",
+  facet_vars = "type",
+  layer = "data"
+)
+p5
+dev.off()
+
+wrap_plots(list(p1, p2, p3, p4, p5), nrow = 1)
+```
+
+Let's have a look at our FMC63+/- status that was based on counts. We can also make a new column for FMC63 status based on CLR instead
+
+```{r}
+# FMC63 status on CLR values: >= 1.5 at t0 (CAR-T product), >= 0 at later timepoints.
+# If changed, update the Details section too.
+fmc63_cutoff_clr_t0 <- 1.5
+fmc63_cutoff_clr <- 0
+
+data_all[["FMC63_clr"]] <- FetchData(data_all, vars = "FMC63", layer = "data")
+
+data_all[[]] <- data_all[[]] |>
+  mutate(
+    FMC63_status_clr = ifelse(
+      FMC63_clr >=
+        ifelse(timepoint == "t0", fmc63_cutoff_clr_t0, fmc63_cutoff_clr),
+      "FMC63+",
+      "FMC63-"
+    )
+  )
+```
+
+```{r fig.width=12, fig.height=4}
+p1 <- VlnPlot(
+  data_all,
+  features = "FMC63",
+  group.by = "type",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  theme_violin() &
+  geom_hline(yintercept = c(0), linewidth = 0.25, linetype = "dashed") &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 abundance (CLR)")
+
+p2 <- VlnPlot(
+  data_all,
+  features = "FMC63",
+  group.by = "FMC63_status",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  theme_violin() &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 abundance (CLR)", title = "FMC63 status based on counts")
+
+p3 <- VlnPlot(
+  data_all,
+  features = "FMC63",
+  group.by = "FMC63_status_clr",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  theme_violin() &
+  theme(legend.position = "right") &
+  labs(y = "FMC63 abundance (CLR)", title = "FMC63 status based on CLR")
+
+p <- p1 | p2 | p3
+p
+
+pdf(
+  here("mpx", "results", "processed", "all_marker_fmc63_violin.pdf"),
+  width = 12,
+  height = 4
+)
+p
+dev.off()
+```
+
+\
+
+
+\
+
+### PCA & UMAP
+
+Then, let's perform the PCA and look at the variance explained by each component. 
+
+```{r fig.width=6, fig.height=4}
+data_all <- data_all |>
+  RunPCA()
+
+ElbowPlot(data_all, ndims = 30)
+```
+
+```{r fig.width=10, fig.height=14}
+DimHeatmap(data_all, dims = 1:18, cells = 500, balanced = TRUE, ncol = 3)
+```
+
+
+Next, we'll use the top most informative PCs to reduce the data into two UMAP dimensions. Most information seems to be captured by the first 10-15 PCs.
+
+```{r}
+n_dims <- 15
+data_all <- data_all |>
+  RunUMAP(reduction = "pca", dims = 1:n_dims, reduction.name = "umap.pca")
+```
+Now, let's visualize the data in UMAP space and see if we can identify any major batch/sample/time differences.
+
+
+```{r fig.width=15, fig.height=5}
+pt_size <- 0.5
+p1 <- DimPlot(
+  object = data_all,
+  reduction = "umap.pca",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p2 <- DimPlot(
+  object = data_all,
+  reduction = "umap.pca",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p3 <- DimPlot(
+  object = data_all,
+  reduction = "umap.pca",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p <- (p1 | p2 | p3)
+p
+pdf(
+  here("mpx", "results", "processed", "all_pca_umap_dimplot.pdf"),
+  width = 15,
+  height = 5
+)
+p
+dev.off()
+```
+
+Here, we can see that the CAR-T product samples stand out by themselves compared to the PBMC samples, which may make it hard for us to find a clear CAR-T cluster within the PBMC samples, unless we were to integrate the samples before clustering. We can also see that donor 44 and donor 50 seems to overlap a bit better, compared to donor 32 which separates a bit from the other donors.
+
+Before proceeding with doing data integration, we can also have a look at some numerical features and how they appear in UMAP space.
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_all,
+  reduction = "umap.pca",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom") &
+  coord_fixed()
+
+p2 <- FeaturePlot(
+  object = data_all,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.pca",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom") &
+  coord_fixed()
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+pdf(
+  here("mpx", "results", "processed", "all_pca_umap_featureplot.pdf"),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+\
+
+### Harmony & UMAP
+
+Let's proceed with performing integration of data by harmonizing the PCs by sample.
+
+```{r}
+integrate_by <- "sample"
+
+data_all <- data_all |>
+  RunHarmony(
+    group.by.vars = integrate_by,
+    plot_convergence = FALSE
+  ) |>
+  RunUMAP(
+    reduction = "harmony",
+    dims = 1:n_dims,
+    reduction.name = "umap.harmony"
+  )
+```
+
+
+```{r fig.width=25, fig.height=5}
+p1 <- DimPlot(
+  object = data_all,
+  reduction = "umap.pca",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Original UMAP") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Harmonized UMAP") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- (p1 | p2 | p3 | p4)
+p
+pdf(
+  here("mpx", "results", "processed", "all_pca_harmony_umap_dimplot.pdf"),
+  width = 25,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p2 <- FeaturePlot(
+  object = data_all,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+pdf(
+  here("mpx", "results", "processed", "all_pca_harmony_umap_featureplot.pdf"),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+FeaturePlot(
+  object = data_all,
+  features = c("CD19", "CD20", "CD14", "CD16", "CD41"),
+  ncol = 5,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+```
+
+\
+
+### Clustering
+
+#### Generate cell clusters
+
+```{r}
+cluster_res <- 0.5
+
+data_all <- data_all |>
+  FindNeighbors(dims = 1:n_dims, reduction = "harmony") |>
+  FindClusters(resolution = cluster_res)
+```
+
+
+```{r fig.width=6, fig.height=5}
+DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "seurat_clusters",
+  cols = cell_palette_unsorted,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+```
+
+Using the FMC63, CD3E, CD4, and CD8 abundance values we can annotate the cell cluster as various cell populations.
+
+\
+
+#### Find cluster marker proteins
+
+```{r}
+DE_cluster <-
+  data_all %>%
+  FindAllMarkers(
+    test.use = "wilcox",
+    assay = "mpxCells",
+    slot = "data",
+    logfc.threshold = 0,
+    return.thresh = 1,
+    mean.fxn = rowMeans,
+    fc.name = "difference"
+  ) %>%
+  as_tibble() |>
+  relocate(gene)
+```
+
+```{r}
+DE_cluster |>
+  filter(p_val_adj < 0.01, difference > 0) |>
+  group_by(cluster) |>
+  slice_max(order_by = difference, n = 10) |>
+  # knitr::kable("simple")
+  display_dt(rownames = FALSE)
+```
+
+
+Plot top markers per cluster.
+
+```{r fig.width = 20, fig.height=8}
+markers_plot <- DE_cluster |>
+  filter(p_val_adj < 0.01, difference > 0) |>
+  group_by(cluster) |>
+  slice_max(order_by = difference, n = 3) |>
+  pull(gene)
+
+markers_plot <- c("CD3E", "CD2", markers_plot, "CD337", "CD19", "CD20") |>
+  unique()
+
+VlnPlot(
+  data_all,
+  group.by = "seurat_clusters",
+  features = markers_plot,
+  pt.size = 0,
+  ncol = 6,
+  cols = cell_palette_unsorted
+) &
+  geom_hline(yintercept = 0, linewidth = 0.25, color = "black") &
+  theme_violin() &
+  NoLegend()
+
+
+p <- VlnPlot(
+  data_all,
+  group.by = "seurat_clusters",
+  features = markers_plot,
+  pt.size = 0,
+  ncol = 6,
+  cols = cell_palette_unsorted
+) &
+  geom_hline(yintercept = 0, linewidth = 0.25, color = "black") &
+  theme_violin() &
+  NoLegend()
+
+export_plot(
+  filename = here(
+    "mpx",
+    "results",
+    "processed",
+    "all_pca_harmony_clusters_markers_violin"
+  ),
+  plot = p,
+  width = 16,
+  height = 8
+)
+```
+
+```{r fig.width=16, fig.height=4}
+lim_break <- 3
+
+DE_cluster %>%
+  group_by(gene) %>%
+  filter(
+    any(
+      p_val_adj < 0.01 &
+        abs(difference) > 0.25
+    )
+  ) %>%
+  select(difference, cluster, gene) %>%
+  tidyr::unite("population", cluster, sep = " ") |>
+  pivot_wider(names_from = "population", values_from = "difference") %>%
+  column_to_rownames("gene") %>%
+  replace(is.na(.), 0) %>%
+  # clipr::write_clip(allow_non_interactive = TRUE) |> # copies the table to the clipboard; disabled for rendering
+  t() |>
+  pheatmap::pheatmap(
+    cellwidth = 10,
+    cellheight = 10,
+    breaks = seq(-lim_break, lim_break, 0.1),
+    color = differential_pal(length(seq(-lim_break, lim_break, 0.1))),
+    border_color = "white",
+    border_width = 0.001,
+    width = 12
+  ) -> cluster_heatmap
+
+cluster_heatmap <- cluster_heatmap |> ggplotify::as.ggplot()
+export_plot(
+  filename = here(
+    "mpx",
+    "results",
+    "processed",
+    "all_pca_harmony_umap_marker_heatmap"
+  ),
+  plot = cluster_heatmap,
+  width = 20,
+  height = 5
+)
+```
+
+\
+
+#### Annotate cell clusters
+
+
+```{r}
+# marker_list <- list(
+#   B = c("CD19", "CD20", "CD22"),
+#   CD4T = c("CD4"),
+#   CD8T = c("CD8"),
+#   gdT = c("TCRVd2", "TCRVg9"),
+#   NK = c("NKp80", "CD94", "CD158", "CD335", "CD337"),
+#   Myeloid = c("CD64", "CD93"),
+#   Mono = c("CD11c", "CD14", "CD45"),
+#   Neutrophils = c("CD66b", "CD10", "CD11b"),
+#   Basophils = c("IgE", "CD193"),
+#   Platelets = c("CD41", "CD62P")
+# )
+```
+
+
+```{r}
+data_all[[]] <- data_all[[]] |>
+  mutate(
+    cluster_annotated = case_when(
+      # seurat_clusters %in% c() ~ "B",
+      seurat_clusters %in% c(0) ~ "CD4 T",
+      seurat_clusters %in% c(6) ~ "CD4 T FMC63hi",
+      seurat_clusters %in% c(2, 7, 9) ~ "CD8 T", # 7: mixed CD8 T / NK, annotated as CD8 T (gating separates the T cells)
+      seurat_clusters %in% c(1) ~ "CD8 T FMC63hi",
+      seurat_clusters %in% c(8) ~ "Other T",
+      seurat_clusters %in% c(11) ~ "NK",
+      seurat_clusters %in% c(4, 5, 13) ~ "Platelets",
+      seurat_clusters %in% c(3, 10, 12) ~ "Myeloid"
+      # seurat_clusters %in% c() ~ "Mono",
+      # seurat_clusters %in% c() ~ "Neutrophils",
+      # seurat_clusters %in% c() ~ "Basophils",
+      # seurat_clusters %in% c() ~ "other", #
+    )
+    # Previous mapping, used for the objects saved on 2025-10-02 (before the
+    # 2026-09-30 updates: isotype filter, gating and FMC63 cutoff). The clusters were
+    # renumbered when re-run, so these cluster numbers no longer apply:
+    # cluster_annotated = case_when(
+    #   seurat_clusters %in% c(0) ~ "CD4 T",
+    #   seurat_clusters %in% c(6) ~ "CD4 T FMC63hi",
+    #   seurat_clusters %in% c(1, 9) ~ "CD8 T",
+    #   seurat_clusters %in% c(2) ~ "CD8 T FMC63hi",
+    #   seurat_clusters %in% c(8) ~ "Other T",
+    #   seurat_clusters %in% c(7) ~ "NK",
+    #   seurat_clusters %in% c(4, 5, 12) ~ "Platelets",
+    #   seurat_clusters %in% c(3, 10, 11) ~ "Myeloid"
+    # )
+  ) |>
+  mutate(cluster_annotated_2 = paste0(seurat_clusters, "_", cluster_annotated))
+
+data_all$cluster_annotated_broad <- ifelse(
+  data_all$cluster_annotated %in% c("CD4 T FMC63hi"),
+  "CD4 T",
+  ifelse(
+    data_all$cluster_annotated %in% c("CD8 T FMC63hi"),
+    "CD8 T",
+    data_all$cluster_annotated
+  )
+)
+```
+
+
+We can also create a column with cell cluster labels based on the broad annotation combined with our own FMC63 status (`FMC63_status_clr`: CLR >= 1.5 at t0 and >= 0 at later timepoints).
+
+```{r}
+data_all$cluster_annotated_fmc <- ifelse(
+  data_all$cluster_annotated_broad %in%
+    c("CD4 T", "CD8 T") &
+    data_all$FMC63_status_clr == "FMC63+",
+  paste0(data_all$cluster_annotated_broad, " ", data_all$FMC63_status_clr),
+  data_all$cluster_annotated_broad
+)
+```
+
+
+#### Gating
+
+We did notice from the original processing, that the T cell CD4/CD8 populations were not always entirely clean. We could also identify T cell doublets, that likely ended up skewing the polarity scores for FMC63 when it was only present on one cell of the conjugate component.
+
+
+We can start by looking at some scatter plots for selected T cell markers to showcase how the clustering isn't entirely clean.
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_all$cluster_annotated_fmc |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_all, cluster_annotated_fmc %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "cluster_annotated_fmc"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_all, cluster_annotated_fmc %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "cluster_annotated_fmc"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here("mpx", "results", "processed", "all_tcell_markers_density_plot.pdf"),
+  width = 10,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+Next we gate the cells in the CD4 and CD8 T cell clusters on their CD3E, CD4 and CD8 abundance (CLR) to clean up the populations. Cells with CD3E > `cutoff_cd3` are T cells; CD4 > `cutoff_cd4` with CD8 < `cutoff_cd8` gives CD4 T cells, and CD4 < `cutoff_cd4` with CD8 > `cutoff_cd8` gives CD8 T cells. Any other T cell (double negative or double positive) is labelled "Other T", and cells with CD3E <= `cutoff_cd3` are labelled "other". CD4 and CD8 T cells are then split by FMC63 status (`FMC63_status_clr`). Cells in all other clusters keep their cluster label.
+
+```{r}
+# Gating of the cells in CD4/CD8 T cell clusters on CLR values.
+# If a cutoff is changed, update the Details section too.
+cutoff_cd3 <- 1
+cutoff_cd4 <- 1
+cutoff_cd8 <- 2
+
+gating_data <- FetchData(
+  data_all,
+  vars = c("CD3E", "CD4", "CD8"),
+  layer = "data"
+)
+gating_data$tcell_gated <- case_when(
+  gating_data$CD3E > cutoff_cd3 &
+    gating_data$CD4 > cutoff_cd4 &
+    gating_data$CD8 < cutoff_cd8 ~ "CD4 T",
+  gating_data$CD3E > cutoff_cd3 &
+    gating_data$CD4 < cutoff_cd4 &
+    gating_data$CD8 > cutoff_cd8 ~ "CD8 T",
+  # Any other CD3+ cell: CD4- CD8- (double negative) or CD4+ CD8+ (double positive)
+  gating_data$CD3E > cutoff_cd3 ~ "Other T",
+  TRUE ~ "other"
+)
+
+data_all <- AddMetaData(data_all, gating_data |> select(tcell_gated))
+```
+
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_all$cluster_annotated_fmc |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_all, cluster_annotated_fmc %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "tcell_gated"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_all, cluster_annotated_fmc %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "tcell_gated"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_tcell_markers_density_plot_gated.pdf"
+  ),
+  width = 10,
+  height = 7
+)
+p
+dev.off()
+```
+
+Finally, let's create new updated population labels.
+
+```{r}
+#' Create new labels: cells in CD4/CD8 T cell clusters get their gated label (CD4 and CD8 T
+#' cells split by FMC63 status); all other cells keep their cluster label.
+#' FMC63- CD4/CD8 T cells are labelled "CD4 T" / "CD8 T".
+mdat_add <- data_all@meta.data |>
+  mutate(
+    celltype = case_when(
+      !cluster_annotated_broad %in% c("CD4 T", "CD8 T") ~ cluster_annotated_fmc,
+      tcell_gated %in% c("CD4 T", "CD8 T") ~ paste0(
+        tcell_gated,
+        " ",
+        FMC63_status_clr
+      ),
+      TRUE ~ tcell_gated
+    ),
+    celltype = gsub(" FMC63-", "", celltype),
+    celltype_broad = gsub(" FMC63\\+", "", celltype)
+  ) |>
+  select(celltype, celltype_broad)
+
+#' Add new metadata cell label column to data object
+data_all <- AddMetaData(data_all, mdat_add)
+```
+
+
+```{r fig.width=16, fig.height=7}
+celltypes_plot <- grep("^CD", data_all$celltype |> unique(), value = T)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_all, celltype %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "celltype"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_all, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "celltype"
+)
+
+p_list[[5]] <- DensityScatterPlot(
+  subset(data_all, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "FMC63",
+  facet_vars = "celltype"
+)
+
+p_list[[6]] <- DensityScatterPlot(
+  subset(data_all, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD8",
+  marker2 = "FMC63",
+  facet_vars = "celltype"
+)
+
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_tcell_markers_density_plot_celltype_updated.pdf"
+  ),
+  width = 16,
+  height = 7
+)
+p
+dev.off()
+```
+
+\
+
+#### Cell cluster figures
+
+
+**UMAP**
+
+```{r fig.width=20, fig.height=5}
+p1 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated_2",
+  cols = cell_palette_unsorted,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters (fine-grained)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Updated clusters with gating") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- (p1 | p2 | p3 | p4) & theme_umap() & labs(x = "UMAP 1", y = "UMAP 2")
+p
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_pca_harmony_umap_cluster_annotation.pdf"
+  ),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+Here we can see that some of the clusters don't fully capture the FMC63+ status. The "CD4 T FMC63hi" cluster is clearly FMC63+, but in the ordinary "CD8 T" cluster we have a division of both FMC63+/- cells, and the same is true for the "CD8 T FMC63hi" cluster.
+
+If we instead look at our own combined broad CD4/CD8 T cell classification with FMC63 status, we get the following:
+
+```{r fig.width=20, fig.height=5}
+p1 <- DimPlot(
+  object = data_all,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated_fmc",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters with FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_all |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Updated clusters with gating") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_all |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 status") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- FeaturePlot(
+  object = data_all |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  features = "FMC63",
+  slot = "data",
+  cols = c("#E5E5E5", "#A64463"),
+  min.cutoff = -1,
+  # "#E5E5E5" "#F3E2E7" "#FCDAE5" "#F0BCCD" "#E29CB3" "#D37C98" "#BE5F7D" "#A64463" "#8F2C4B" "#781534"
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 abundance (CLR)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- (p1 | p2 | p3 | p4) & theme_umap() & labs(x = "UMAP 1", y = "UMAP 2")
+p
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_pca_harmony_umap_cluster_annotation_fmc.pdf"
+  ),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+\
+
+**Fraction of FMC63+/- cells across populations**
+
+For every broad cell type, visualize the proportion of FMC63+/- cells.
+
+```{r fig.width=10, fig.height=4}
+groups_plot <- list(
+  c("CAR-T_product", "t0"),
+  c("PBMC", "t1"),
+  c("PBMC", "t2")
+)
+
+p_list <- lapply(groups_plot, function(params) {
+  t <- params[1]
+  tp <- params[2] #ifelse(t == "CAR-T_product", "t0", "t1")
+  # message(t, tp)
+  CellCountPlot(
+    data_all |>
+      subset(!celltype == "discard") |>
+      subset(type == t & timepoint == tp),
+    color_by = "FMC63_status_clr",
+    group_by = "celltype",
+    as_frequency = F,
+    show_count = T,
+    stack = T
+  ) &
+    scale_fill_manual(values = fmc_status_col) &
+    labs(fill = "", title = paste0(t, " (", tp, ")")) &
+    theme_linedraw(base_size = 14) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        panel.grid = element_blank(),
+        panel.border = element_rect(
+          color = "black",
+          fill = NA,
+          linewidth = 0.5
+        ),
+        legend.position = "top"
+      )
+})
+
+wrap_plots(p_list)
+```
+
+```{r fig.width=8, fig.height=3}
+VlnPlot(
+  data_all |> subset(!celltype == "discard"),
+  features = "FMC63",
+  split.by = "celltype_broad",
+  group.by = "timepoint",
+  pt.size = 0.01
+) &
+  scale_fill_manual(values = cell_palette) &
+  geom_hline(yintercept = 0, linewidth = 0.25) &
+  labs(
+    y = "FMC63 abundance (CLR)",
+    title = "FMC63 levels across cell populations and timepoints"
+  ) &
+  theme_violin() &
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.text = element_text(size = 11)
+  )
+```
+*(t0: CAR-T product)*
+
+From these plots we can see that FMC63+ cells is somewhat in equal fractions before infusion (t0; CAR-T product). However, after infusion (t1; 8-9 dpi) it is the FMC63+ CD8+ T cells that remains and potentially even expands. At the 13 dpi (t2 in donor 32), the number of FMC63+ cells has decline substantially and detection of FMC63 is only possible in a very small fraction of T cells.
+
+\
+
+**Cell type proportions**
+
+Make figure with cell type proportions across samples (split by donor & all donors t0-t1)
+
+For this, we can make an alluvial plot using the ggalluvial R package: https://corybrunson.github.io/ggalluvial/ 
+
+First we need to compute the cell type frequencies across samples.
+
+```{r}
+cellcluster_freq_tbl_broad <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  group_by(sample, celltype_broad) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(celltype_broad = as.factor(celltype_broad))
+
+cellcluster_freq_tbl_broad |> display_dt(rownames = FALSE)
+```
+
+```{r}
+cellcluster_freq_tbl <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  group_by(sample, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(celltype = as.factor(celltype))
+
+cellcluster_freq_tbl |> display_dt(rownames = FALSE) # knitr::kable()
+```
+
+
+```{r fig.width=12, fig.height=4}
+donor_select <- "donor_32"
+lab_title <- gsub("^d", "D", gsub("_", " ", donor_select))
+
+p1 <- ggplot(
+  cellcluster_freq_tbl_broad |> filter(donor == donor_select),
+  aes(y = pct, x = timepoint)
+) +
+  geom_alluvium(
+    aes(alluvium = celltype_broad, fill = celltype_broad),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype_broad), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(
+  cellcluster_freq_tbl |> filter(donor == donor_select),
+  aes(y = pct, x = timepoint)
+) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p <- (p1 | p2) +
+  plot_annotation(
+    title = paste("Cell proportions across timepoints in", lab_title),
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold")
+    )
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_cell_cluster_proportion_flow_d32.pdf"
+  ),
+  width = 12,
+  height = 4
+)
+p
+dev.off()
+```
+
+
+
+
+We can also compute the overall fraction seen across donors from t0 to t1.
+
+```{r fig.width=8, fig.height=4}
+#' Create tables with data
+cellcluster_freq_t0t1_tbl_broad <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(timepoint %in% c("t0", "t1")) |>
+  group_by(timepoint, celltype_broad) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype_broad = as.factor(celltype_broad))
+
+cellcluster_freq_t0t1_tbl <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(timepoint %in% c("t0", "t1")) |>
+  group_by(timepoint, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype = as.factor(celltype))
+
+cellcluster_freq_t0t1_tbl |> display_dt(rownames = FALSE)
+
+#' Plot
+p1 <- ggplot(cellcluster_freq_t0t1_tbl_broad, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = celltype_broad, fill = celltype_broad),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype_broad), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(cellcluster_freq_t0t1_tbl, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p <- (p1 | p2) +
+  plot_annotation(
+    title = "Cell proportions across donors",
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold")
+    )
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_cell_cluster_proportion_flow_t0t1.pdf"
+  ),
+  width = 8,
+  height = 4
+)
+(p1 | p2)
+dev.off()
+```
+
+
+\
+
+**FMC63+ fractions in T cells**
+
+Plot FMC63+ fraction in CD4/CD8 T cells
+
+```{r}
+#' Use this if you want to compute the percentage vs the total cell (or total T cell) population
+sample_tcell_count_all <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  # filter(cluster_annotated_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample) |>
+  summarize(n_cells_total = n())
+
+sample_tcell_count <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample, celltype_broad) |>
+  summarize(n_cells_tcell = n()) |>
+  mutate(sample_cluster = paste0(sample, "_", celltype_broad)) |>
+  ungroup() |>
+  select(sample_cluster, n_cells_tcell)
+
+sample_tcell_tot_count <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  mutate(
+    celltype_tcell = ifelse(
+      celltype_broad %in% c("CD4 T", "CD8 T"),
+      "T cell",
+      "other"
+    )
+  ) |>
+  filter(celltype_tcell %in% c("T cell")) |>
+  group_by(sample) |>
+  summarize(n_cells_tcell_tot = n()) |>
+  ungroup() |>
+  select(sample, n_cells_tcell_tot)
+
+#'
+cellcluster_fmc_freq_tbl <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample, celltype_broad, FMC63_status_clr) |>
+  summarize(n_cells = n()) |>
+  merge(sample_tcell_count_all, by = "sample") |>
+  mutate(sample_cluster = paste0(sample, "_", celltype_broad)) |>
+  merge(sample_tcell_count, by = "sample_cluster") |>
+  merge(sample_tcell_tot_count, by = "sample") |>
+  mutate(fraction_total_cells = n_cells / n_cells_total) |> # Use this if you want to compute the percentage vs the total cell population
+  mutate(fraction_total_tcells = n_cells / n_cells_tcell) |> # Use this if you want to compute the percentage vs respective CD4/CD8 population
+  mutate(fraction_total_tcells_all = n_cells / n_cells_tcell_tot) |> # Use this if you want to compute the percentage vs the total T cell population
+  # mutate(fraction_total_subtcell = n_cells / sum(n_cells)) |>  # Use this if you want to compute the percentage vs all cells
+  # mutate(pct = round(fraction, 3)*100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(
+    celltype_broad = as.factor(celltype_broad),
+    FMC63_status_clr = as.factor(FMC63_status_clr)
+  )
+
+cellcluster_fmc_freq_tbl |> display_dt(rownames = FALSE) # knitr::kable()
+```
+
+
+```{r fig.width=6, fig.height=3}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_tcells * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective sample's CD4 or CD8 T cell population"
+  ) +
+  ylim(0, 100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_cell_cluster_fmc63_tcell_pct_line.pdf"
+  ),
+  width = 6,
+  height = 3
+)
+p
+dev.off()
+```
+
+```{r fig.width=6, fig.height=3}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_tcells_all * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective sample's total T cell population"
+  ) +
+  ylim(0, 100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_cell_cluster_fmc63_tcell_all_pct_line.pdf"
+  ),
+  width = 6,
+  height = 3
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=6, fig.height=3}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_cells * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective sample's total cell population"
+  ) +
+  ylim(0, 40) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "all_cell_cluster_fmc63_total_pct_line.pdf"
+  ),
+  width = 6,
+  height = 3
+)
+p
+dev.off()
+```
+
+\
+
+### CLR abundance for all markers
+
+```{r fig.width=14, fig.height=4}
+#| message: false
+#| warning: false
+markers_all <- rownames(data_all) |> sort()
+celltypes_keep <- grep("CD", data_all$celltype, value = T) |> unique() |> sort()
+
+dat_subset <- data_all |>
+  subset(celltype %in% celltypes_keep)
+
+dat_subset$donor_sample <- paste0(dat_subset$donor, "_", dat_subset$timepoint)
+
+p_list <- lapply(markers_all, function(m) {
+  p <- VlnPlot(
+    dat_subset,
+    features = m,
+    layer = "data",
+    split.by = "celltype",
+    group.by = "donor_sample",
+    cols = cell_palette[celltypes_keep],
+    pt.size = 0.05,
+    alpha = 0.5
+  ) &
+    theme_violin() &
+    theme(
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 12),
+      axis.text.x = element_text(angle = 0, hjust = 0.5)
+    ) &
+    labs(y = "Abundance CLR")
+})
+p_list <- setNames(p_list, nm = markers_all)
+
+rm(dat_subset)
+
+pdf(
+  here("mpx", "results", "processed", "all_abundance_CLR_all_markers.pdf"),
+  width = 14,
+  height = 4
+)
+for (p in p_list) {
+  print(p)
+}
+dev.off()
+```
+
+```{r fig.width=14, fig.height=4}
+#| results: asis
+#| message: false
+#| warning: false
+tabset_df <- tibble(
+  name = names(p_list),
+  fig = p_list
+)
+
+tabset_df |>
+  quartabs::render_tabset(name, fig)
+```
+
+\
+
+### Export processed data
+
+```{r}
+# The log-count assay was only used for QC plots; drop it before saving
+data_all[["log_assay"]] <- NULL
+saveRDS(
+  data_all,
+  file = here("mpx", "rdata", "robj_suzuki_cart_processed_data_all.rds")
+)
+```
+
+
+\
+
+## T1 vs T0 comparison
+
+First we will subset the data to only contain the CAR-T product (t0) and the PBMC samples collected at 8-9 dpi (t1), across all three donors.
+
+```{r}
+data_t0t1 <- data_combined_filt |>
+  subset(timepoint %in% c("t0", "t1"))
+```
+
+\
+
+### CLR normalization
+
+As before, normalization is done using the CLR approach.
+
+```{r}
+data_t0t1 <- data_t0t1 |>
+  NormalizeMPX(method = "clr") |>
+  ScaleData()
+```
+
+\
+
+### Figures
+
+Let's have a look at our FMC63+/- status that was based on counts. We'll also make a new column for FMC63 status based on CLR.
+
+```{r}
+# FMC63 status on CLR values: >= 1.5 at t0 (CAR-T product), >= 0 at later timepoints.
+# If changed, update the Details section too.
+fmc63_cutoff_clr_t0 <- 1.5
+fmc63_cutoff_clr <- 0
+data_t0t1[["FMC63_clr"]] <- FetchData(data_t0t1, vars = "FMC63", layer = "data")
+data_t0t1[[]] <- data_t0t1[[]] |>
+  mutate(
+    FMC63_status_clr = ifelse(
+      FMC63_clr >=
+        ifelse(timepoint == "t0", fmc63_cutoff_clr_t0, fmc63_cutoff_clr),
+      "FMC63+",
+      "FMC63-"
+    )
+  )
+```
+
+
+**Violin** 
+
+```{r fig.width=12, fig.height=4}
+p1 <- VlnPlot(
+  data_t0t1,
+  features = "FMC63",
+  group.by = "type",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  scale_fill_manual(values = pal_samples) &
+  theme_violin() &
+  geom_hline(yintercept = c(0), linewidth = 0.25, linetype = "dashed") &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 abundance (CLR)")
+
+p2 <- VlnPlot(
+  data_t0t1,
+  features = "FMC63",
+  group.by = "FMC63_status",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  scale_fill_manual(values = pal_samples) &
+  theme_violin() &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 abundance (CLR)", title = "FMC63 status based on counts")
+
+p3 <- VlnPlot(
+  data_t0t1,
+  features = "FMC63",
+  group.by = "FMC63_status_clr",
+  split.by = "sample",
+  pt.size = 0.01
+) &
+  scale_fill_manual(values = pal_samples) &
+  theme_violin() &
+  theme(legend.position = "right") &
+  labs(y = "FMC63 abundance (CLR)", title = "FMC63 status based on CLR")
+
+p <- p1 | p2 | p3
+p
+
+pdf(
+  here("mpx", "results", "processed", "t0t1_marker_fmc63_violin.pdf"),
+  width = 12,
+  height = 4
+)
+p
+dev.off()
+```
+
+
+### PCA & UMAP
+
+Perform PCA and look at the variance explained by each component. 
+
+```{r fig.width=6, fig.height=4}
+data_t0t1 <- data_t0t1 |>
+  RunPCA()
+
+ElbowPlot(data_t0t1, ndims = 30)
+```
+
+```{r fig.width=10, fig.height=14}
+DimHeatmap(data_t0t1, dims = 1:18, cells = 500, balanced = TRUE, ncol = 3)
+```
+
+
+Next, we'll use the top most informative PCs to reduce the data into two UMAP dimensions. As before, most information seems to be captured by the first 10-15 PCs.
+
+```{r}
+n_dims <- 15
+data_t0t1 <- data_t0t1 |>
+  RunUMAP(reduction = "pca", dims = 1:n_dims, reduction.name = "umap.pca")
+```
+
+
+
+```{r fig.width=15, fig.height=5}
+pt_size <- 0.5
+p1 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.pca",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p2 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.pca",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p3 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.pca",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right") &
+  coord_fixed()
+
+p <- (p1 | p2 | p3)
+p
+pdf(
+  here("mpx", "results", "processed", "t0t1_pca_umap_dimplot.pdf"),
+  width = 15,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+Before proceeding with doing data integration, we can also have a look at some numerical features and how they appear in UMAP space.
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.pca",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom") &
+  coord_fixed()
+
+p2 <- FeaturePlot(
+  object = data_t0t1,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.pca",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom") &
+  coord_fixed()
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+pdf(
+  here("mpx", "results", "processed", "t0t1_pca_umap_featureplot.pdf"),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+\
+
+### Harmony & UMAP
+
+Let's proceed with performing integration of data by harmonizing the PCs by sample.
+
+```{r}
+integrate_by <- "sample"
+
+data_t0t1 <- data_t0t1 |>
+  RunHarmony(
+    group.by.vars = integrate_by,
+    plot_convergence = FALSE
+  ) |>
+  RunUMAP(
+    reduction = "harmony",
+    dims = 1:n_dims,
+    reduction.name = "umap.harmony"
+  )
+```
+
+
+```{r fig.width=25, fig.height=5}
+p1 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.pca",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Original UMAP") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Harmonized UMAP") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- (p1 | p2 | p3 | p4)
+p
+pdf(
+  here("mpx", "results", "processed", "t0t1_pca_harmony_umap_dimplot.pdf"),
+  width = 25,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p2 <- FeaturePlot(
+  object = data_t0t1,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+
+pdf(
+  here("mpx", "results", "processed", "t0t1_pca_harmony_umap_featureplot.pdf"),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+FeaturePlot(
+  object = data_t0t1,
+  features = c("CD19", "CD20", "CD14", "CD16", "CD41"),
+  ncol = 5,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  slot = "data",
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+```
+
+\
+
+### Clustering
+
+#### Generate cell clusters
+
+```{r}
+cluster_res <- 0.5
+
+data_t0t1 <- data_t0t1 |>
+  FindNeighbors(dims = 1:n_dims, reduction = "harmony") |>
+  FindClusters(resolution = cluster_res)
+```
+
+
+```{r fig.width=6, fig.height=5}
+DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "seurat_clusters",
+  cols = cell_palette_unsorted,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+```
+
+\
+
+#### Find cluster marker proteins
+
+```{r}
+DE_cluster_t0t1 <-
+  data_t0t1 %>%
+  FindAllMarkers(
+    test.use = "wilcox",
+    assay = "mpxCells",
+    slot = "data",
+    logfc.threshold = 0,
+    return.thresh = 1,
+    mean.fxn = rowMeans,
+    fc.name = "difference"
+  ) %>%
+  as_tibble()
+```
+
+```{r}
+DE_cluster_t0t1 |>
+  filter(p_val_adj < 0.01, difference > 0) |>
+  group_by(cluster) |>
+  slice_max(order_by = difference, n = 10) |>
+  relocate(gene) |>
+  display_dt(rownames = FALSE)
+# knitr::kable("simple")
+```
+
+
+Plot top markers per cluster.
+
+```{r fig.width = 20, fig.height=8}
+markers_plot <- DE_cluster_t0t1 |>
+  filter(p_val_adj < 0.01, difference > 0) |>
+  group_by(cluster) |>
+  slice_max(order_by = difference, n = 3) |>
+  pull(gene)
+
+markers_plot <- c("CD3E", "CD2", markers_plot, "CD337", "CD19", "CD20") |>
+  unique()
+
+VlnPlot(
+  data_t0t1,
+  group.by = "seurat_clusters",
+  features = markers_plot,
+  pt.size = 0,
+  ncol = 6,
+  cols = cell_palette_unsorted
+) &
+  geom_hline(yintercept = 0, linewidth = 0.25, color = "black") &
+  theme_violin() &
+  NoLegend()
+```
+
+```{r fig.width=16, fig.height=4}
+lim_break <- 3
+
+DE_cluster_t0t1 %>%
+  group_by(gene) %>%
+  filter(
+    any(
+      p_val_adj < 0.01 &
+        abs(difference) > 0.25
+    )
+  ) %>%
+  select(difference, cluster, gene) %>%
+  tidyr::unite("population", cluster, sep = " ") |>
+  pivot_wider(names_from = "population", values_from = "difference") %>%
+  column_to_rownames("gene") %>%
+  replace(is.na(.), 0) %>%
+  # clipr::write_clip(allow_non_interactive = TRUE) |> # copies the table to the clipboard; disabled for rendering
+  t() |>
+  pheatmap::pheatmap(
+    cellwidth = 10,
+    cellheight = 10,
+    breaks = seq(-lim_break, lim_break, 0.1),
+    color = differential_pal(length(seq(-lim_break, lim_break, 0.1))),
+    border_color = "white",
+    border_width = 0.001,
+    width = 12
+  ) -> cluster_heatmap
+```
+
+\
+
+#### Annotate cell clusters
+
+
+```{r}
+# marker_list <- list(
+#   B = c("CD19", "CD20", "CD22"),
+#   CD4T = c("CD4"),
+#   CD8T = c("CD8"),
+#   gdT = c("TCRVd2", "TCRVg9"),
+#   NK = c("NKp80", "CD94", "CD158", "CD335", "CD337"),
+#   Myeloid = c("CD64", "CD93"),
+#   Mono = c("CD11c", "CD14", "CD45"),
+#   Neutrophils = c("CD66b", "CD10", "CD11b"),
+#   Basophils = c("IgE", "CD193"),
+#   Platelets = c("CD41", "CD62P")
+# )
+```
+
+```{r}
+data_t0t1[[]] <- data_t0t1[[]] |>
+  mutate(
+    cluster_annotated = case_when(
+      # seurat_clusters %in% c() ~ "B",
+      seurat_clusters %in% c(0) ~ "CD4 T",
+      seurat_clusters %in% c(3) ~ "CD4 T FMC63hi",
+      seurat_clusters %in% c(2, 6, 9) ~ "CD8 T",
+      seurat_clusters %in% c(4) ~ "CD8 T FMC63hi",
+      seurat_clusters %in% c(8) ~ "Other T",
+      seurat_clusters %in% c(10) ~ "NK",
+      seurat_clusters %in% c(1, 7, 11) ~ "Platelets",
+      seurat_clusters %in% c(5) ~ "Myeloid"
+      # seurat_clusters %in% c() ~ "Mono",
+      # seurat_clusters %in% c() ~ "Neutrophils",
+      # seurat_clusters %in% c() ~ "Basophils",
+      # seurat_clusters %in% c() ~ "other", #
+    )
+    # Previous mapping, used for the objects saved on 2025-10-02 (before the
+    # 2026-09-30 updates: isotype filter, gating and FMC63 cutoff). The clusters were
+    # renumbered when re-run, so these cluster numbers no longer apply:
+    # cluster_annotated = case_when(
+    #   seurat_clusters %in% c(0) ~ "CD4 T",
+    #   seurat_clusters %in% c(4) ~ "CD4 T FMC63hi",
+    #   seurat_clusters %in% c(1,6) ~ "CD8 T",
+    #   seurat_clusters %in% c(5) ~ "CD8 T FMC63hi",
+    #   seurat_clusters %in% c(8) ~ "Other T",
+    #   seurat_clusters %in% c(9) ~ "NK",
+    #   seurat_clusters %in% c(2,7,10) ~ "Platelets",
+    #   seurat_clusters %in% c(3) ~ "Myeloid"
+    # )
+    # Older mapping from an earlier run (kept for reference):
+    # cluster_annotated = case_when(
+    #   # seurat_clusters %in% c() ~ "B",
+    #   seurat_clusters %in% c(0) ~ "CD4 T",
+    #   seurat_clusters %in% c(5) ~ "CD4 T FMC63hi",
+    #   seurat_clusters %in% c(3, 9) ~ "CD8 T",
+    #   seurat_clusters %in% c(2) ~ "CD8 T FMC63hi",
+    #   seurat_clusters %in% c(8) ~ "Other T",
+    #   seurat_clusters %in% c(7) ~ "NK",
+    #   seurat_clusters %in% c(1,6,10) ~ "Platelets",
+    #   seurat_clusters %in% c(4) ~ "Myeloid"
+    #   # seurat_clusters %in% c() ~ "Mono",
+    #   # seurat_clusters %in% c() ~ "Neutrophils",
+    #   # seurat_clusters %in% c() ~ "Basophils",
+    #   # seurat_clusters %in% c() ~ "other", #
+    # )
+  ) |>
+  mutate(cluster_annotated_2 = paste0(seurat_clusters, "_", cluster_annotated))
+
+data_t0t1$cluster_annotated_broad <- ifelse(
+  data_t0t1$cluster_annotated %in% c("CD4 T FMC63hi"),
+  "CD4 T",
+  ifelse(
+    data_t0t1$cluster_annotated %in% c("CD8 T FMC63hi"),
+    "CD8 T",
+    data_t0t1$cluster_annotated
+  )
+)
+
+data_t0t1$cluster_annotated_fmc <- ifelse(
+  data_t0t1$cluster_annotated_broad %in%
+    c("CD4 T", "CD8 T") &
+    data_t0t1$FMC63_status_clr == "FMC63+",
+  paste0(data_t0t1$cluster_annotated_broad, " ", data_t0t1$FMC63_status_clr),
+  data_t0t1$cluster_annotated_broad
+)
+```
+
+
+\
+
+#### Gating (NEW)
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_t0t1$cluster_annotated_fmc |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_t0t1, cluster_annotated_fmc %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "cluster_annotated_fmc"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_t0t1, cluster_annotated_fmc %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "cluster_annotated_fmc"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here("mpx", "results", "processed", "t0t1_tcell_markers_density_plot.pdf"),
+  width = 10,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+Next we gate the cells in the CD4 and CD8 T cell clusters on their CD3E, CD4 and CD8 abundance (CLR) to clean up the populations. Cells with CD3E > `cutoff_cd3` are T cells; CD4 > `cutoff_cd4` with CD8 < `cutoff_cd8` gives CD4 T cells, and CD4 < `cutoff_cd4` with CD8 > `cutoff_cd8` gives CD8 T cells. Any other T cell (double negative or double positive) is labelled "Other T", and cells with CD3E <= `cutoff_cd3` are labelled "other". CD4 and CD8 T cells are then split by FMC63 status (`FMC63_status_clr`). Cells in all other clusters keep their cluster label.
+
+```{r}
+# Gating of the cells in CD4/CD8 T cell clusters on CLR values.
+# If a cutoff is changed, update the Details section too.
+cutoff_cd3 <- 1
+cutoff_cd4 <- 1
+cutoff_cd8 <- 2
+
+gating_data <- FetchData(
+  data_t0t1,
+  vars = c("CD3E", "CD4", "CD8"),
+  layer = "data"
+)
+gating_data$tcell_gated <- case_when(
+  gating_data$CD3E > cutoff_cd3 &
+    gating_data$CD4 > cutoff_cd4 &
+    gating_data$CD8 < cutoff_cd8 ~ "CD4 T",
+  gating_data$CD3E > cutoff_cd3 &
+    gating_data$CD4 < cutoff_cd4 &
+    gating_data$CD8 > cutoff_cd8 ~ "CD8 T",
+  # Any other CD3+ cell: CD4- CD8- (double negative) or CD4+ CD8+ (double positive)
+  gating_data$CD3E > cutoff_cd3 ~ "Other T",
+  TRUE ~ "other"
+)
+
+data_t0t1 <- AddMetaData(data_t0t1, gating_data |> select(tcell_gated))
+```
+
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_t0t1$cluster_annotated_fmc |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_t0t1, cluster_annotated_fmc %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "tcell_gated"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_t0t1, cluster_annotated_fmc %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "tcell_gated"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "t0t1_tcell_markers_density_plot_gated.pdf"
+  ),
+  width = 10,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+
+Finally, let's create new updated population labels.
+
+```{r}
+#' Create new labels: cells in CD4/CD8 T cell clusters get their gated label (CD4 and CD8 T
+#' cells split by FMC63 status); all other cells keep their cluster label.
+#' FMC63- CD4/CD8 T cells are labelled "CD4 T" / "CD8 T".
+mdat_add <- data_t0t1@meta.data |>
+  mutate(
+    celltype = case_when(
+      !cluster_annotated_broad %in% c("CD4 T", "CD8 T") ~ cluster_annotated_fmc,
+      tcell_gated %in% c("CD4 T", "CD8 T") ~ paste0(
+        tcell_gated,
+        " ",
+        FMC63_status_clr
+      ),
+      TRUE ~ tcell_gated
+    ),
+    celltype = gsub(" FMC63-", "", celltype),
+    celltype_broad = gsub(" FMC63\\+", "", celltype)
+  ) |>
+  select(celltype, celltype_broad)
+
+#' Add new metadata cell label column to data object
+data_t0t1 <- AddMetaData(data_t0t1, mdat_add)
+```
+
+
+```{r fig.width=16, fig.height=7}
+celltypes_plot <- grep("^CD", data_t0t1$celltype |> unique(), value = T)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_t0t1, celltype %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "celltype"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_t0t1, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "celltype"
+)
+
+p_list[[5]] <- DensityScatterPlot(
+  subset(data_t0t1, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "FMC63",
+  facet_vars = "celltype"
+)
+
+p_list[[6]] <- DensityScatterPlot(
+  subset(data_t0t1, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD8",
+  marker2 = "FMC63",
+  facet_vars = "celltype"
+)
+
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "t0t1_tcell_markers_density_plot_celltype_updated.pdf"
+  ),
+  width = 16,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+\
+
+#### Cell cluster figures
+
+
+**UMAP**
+
+```{r fig.width=18, fig.height=15}
+p1 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated_2",
+  cols = cell_palette_unsorted,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters (fine-grained)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_t0t1,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Updated clusters with gating") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- DimPlot(
+  object = data_t0t1 |> subset(celltype != "discard"),
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Updated clusters with gating") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p5 <- DimPlot(
+  object = data_t0t1 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p6 <- FeaturePlot(
+  object = data_t0t1 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  features = "FMC63",
+  slot = "data",
+  cols = c("#E5E5E5", "#A64463"),
+  min.cutoff = -1,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 abundance (CLR)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p7 <- DimPlot(
+  object = data_t0t1 |> subset(celltype != "discard"),
+  reduction = "umap.harmony",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Sample") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p8 <- DimPlot(
+  object = data_t0t1 |> subset(celltype != "discard"),
+  reduction = "umap.harmony",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  labs(title = "Donor") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p9 <- DimPlot(
+  object = data_t0t1 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  labs(title = "Time point") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+
+p <- ((p1 | p2 | p3) / (p4 | p5 | p6) / (p7 | p8 | p9)) &
+  theme_umap() &
+  labs(x = "UMAP 1", y = "UMAP 2")
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "t0t1_pca_harmony_umap_cluster_annotation.pdf"
+  ),
+  width = 18,
+  height = 15
+)
+p
+dev.off()
+```
+
+
+
+\
+
+**Fraction of FMC63+/- cells across populations**
+
+For every cell type, visualize the proportion of FMC63+/- cells.
+
+```{r fig.width=6, fig.height=4}
+groups_plot <- list(
+  c("CAR-T_product", "t0"),
+  c("PBMC", "t1")
+)
+
+donor_plot <- data_t0t1$donor |> unique()
+
+p_list_donor <- lapply(donor_plot, function(d) {
+  p_list <- lapply(groups_plot, function(params) {
+    t <- params[1]
+    tp <- params[2]
+    CellCountPlot(
+      data_t0t1 |> subset(type == t & timepoint == tp & donor == d),
+      color_by = "FMC63_status_clr",
+      group_by = "celltype_broad",
+      as_frequency = F,
+      show_count = T,
+      stack = T
+    ) &
+      scale_fill_manual(values = fmc_status_col) &
+      labs(fill = "", title = paste0(t, " (", tp, ")")) &
+      theme_linedraw(base_size = 14) +
+        theme(
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5, size = 14),
+          panel.grid = element_blank(),
+          panel.border = element_rect(
+            color = "black",
+            fill = NA,
+            linewidth = 0.5
+          ),
+          legend.position = "top"
+        )
+  })
+  Reduce(`|`, p_list) +
+    plot_annotation(
+      subtitle = d,
+      theme = theme(
+        plot.subtitle = element_text(hjust = 0.5, size = 14, face = "bold")
+      )
+    )
+})
+
+p_list_donor
+```
+
+```{r fig.width=6, fig.height=3}
+VlnPlot(
+  data_t0t1,
+  features = "FMC63",
+  split.by = "celltype",
+  group.by = "timepoint",
+  pt.size = 0.01
+) &
+  scale_fill_manual(values = cell_palette) &
+  geom_hline(yintercept = 0, linewidth = 0.25) &
+  labs(
+    y = "FMC63 abundance (CLR)",
+    title = "FMC63 levels across cell populations and timepoints"
+  ) &
+  theme_violin() &
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.text = element_text(size = 11)
+  )
+```
+
+\
+
+
+**Cell type proportions**
+
+Compute the overall fraction seen across donors from t0 to t1.
+
+```{r fig.width=8, fig.height=4}
+#' Create tables with data
+cellcluster_freq_t0t1_tbl_broad <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(timepoint %in% c("t0", "t1")) |>
+  group_by(timepoint, celltype_broad) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype_broad = as.factor(celltype_broad))
+
+cellcluster_freq_t0t1_tbl <- data_all@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(timepoint %in% c("t0", "t1")) |>
+  group_by(timepoint, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype = as.factor(celltype))
+
+cellcluster_freq_t0t1_tbl |> display_dt(rownames = FALSE)
+
+#' Plot
+p1 <- ggplot(cellcluster_freq_t0t1_tbl_broad, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = celltype_broad, fill = celltype_broad),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype_broad), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(cellcluster_freq_t0t1_tbl, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(y = "Cell type proportion (%)", x = "Timepoint", fill = "Cell type") +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p <- (p1 | p2) +
+  plot_annotation(
+    title = "Cell proportions across donors",
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold")
+    )
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "t0t1_cell_cluster_proportion_flow_t0t1.pdf"
+  ),
+  width = 8,
+  height = 4
+)
+(p1 | p2)
+dev.off()
+```
+
+
+First we need to compute the cell type frequencies across samples.
+
+```{r}
+cellcluster_freq_tbl_all <- data_t0t1@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  group_by(timepoint, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  mutate(celltype = as.factor(celltype))
+```
+
+```{r}
+sample_n_cells <- data_t0t1@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  group_by(sample) |>
+  summarize(n_cells_total = n())
+
+cellcluster_freq_tbl <- data_t0t1@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  group_by(sample, celltype) |>
+  summarize(n_cells = n()) |>
+  merge(sample_n_cells, by = "sample") |>
+  mutate(fraction = n_cells / n_cells_total) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(celltype = as.factor(celltype))
+
+cellcluster_freq_tbl |> display_dt(rownames = FALSE) #knitr::kable()
+```
+
+
+```{r fig.width=18, fig.height=4}
+#' Plot for all
+p1 <- ggplot(cellcluster_freq_tbl_all, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(
+    y = "Cell type proportion (%)",
+    x = "Timepoint",
+    fill = "Cell type",
+    title = "All donors"
+  ) +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#' Plot per donor
+donor_plot <- cellcluster_freq_tbl_broad$donor |> unique() |> sort()
+
+p_list_donor <- lapply(donor_plot, function(donor_select) {
+  lab_title <- gsub("^d", "D", gsub("_", " ", donor_select))
+  ggplot(
+    cellcluster_freq_tbl |> filter(donor == donor_select),
+    aes(y = pct, x = timepoint)
+  ) +
+    geom_alluvium(
+      aes(alluvium = celltype, fill = celltype),
+      alpha = .3,
+      color = "black"
+    ) +
+    geom_col(aes(fill = celltype), width = .4, color = "black") +
+    scale_fill_manual(values = cell_palette) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      labels = scales::percent_format(scale = 1)
+    ) +
+    labs(
+      y = "Cell type proportion (%)",
+      x = "Timepoint",
+      fill = "Cell type",
+      title = lab_title
+    ) +
+    cowplot::theme_minimal_hgrid() +
+    theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+})
+
+#' Wrap all plots together and plot jointly
+p_list_donor[[4]] <- p1
+p <- Reduce(`|`, p_list_donor)
+p
+
+pdf(
+  here("mpx", "results", "processed", "t0t1_cell_cluster_proportion_flow.pdf"),
+  width = 18,
+  height = 4
+)
+p
+dev.off()
+```
+
+\
+
+**FMC63+ fractions in T cells**
+
+Plot FMC63+ fraction in CD4/CD8 T cells
+
+```{r}
+#' Use this if you want to compute the percentage vs the total cell (or total T cell) population
+sample_tcell_count_all <- data_t0t1@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  # filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample) |>
+  summarize(n_cells_total = n())
+
+sample_tcell_count <- data_t0t1@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample, celltype_broad) |>
+  summarize(n_cells_tcell = n()) |>
+  mutate(sample_cluster = paste0(sample, "_", celltype_broad)) |>
+  ungroup() |>
+  select(sample_cluster, n_cells_tcell)
+
+#'
+cellcluster_fmc_freq_tbl <- data_t0t1@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample, celltype_broad, FMC63_status_clr) |>
+  summarize(n_cells = n()) |>
+  merge(sample_tcell_count_all, by = "sample") |>
+  mutate(sample_cluster = paste0(sample, "_", celltype_broad)) |>
+  merge(sample_tcell_count, by = "sample_cluster") |>
+  mutate(fraction_total_cells = n_cells / n_cells_total) |> # Use this if you want to compute the percentage vs the total cell population
+  mutate(fraction_total_tcells = n_cells / n_cells_tcell) |> # Use this if you want to compute the percentage vs respective CD4/CD8 population
+  # mutate(fraction_total_subtcell = n_cells / sum(n_cells)) |>  # Use this if you want to compute the percentage vs all cells
+  # mutate(pct = round(fraction, 3)*100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(
+    celltype_broad = as.factor(celltype_broad),
+    FMC63_status_clr = as.factor(FMC63_status_clr)
+  )
+
+cellcluster_fmc_freq_tbl |> display_dt(rownames = FALSE) # knitr::kable()
+```
+
+
+```{r fig.width=6, fig.height=3}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_tcells * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective sample's CD4 or CD8 T cell population"
+  ) +
+  ylim(0, 100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "t0t1_cell_cluster_fmc63_tcell_pct_line.pdf"
+  ),
+  width = 6,
+  height = 3
+)
+p
+dev.off()
+```
+
+```{r fig.width=6, fig.height=3}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_cells * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective sample's total cell population"
+  ) +
+  ylim(0, 40) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "t0t1_cell_cluster_fmc63_total_pct_line.pdf"
+  ),
+  width = 6,
+  height = 3
+)
+p
+dev.off()
+```
+
+
+\
+
+### Export processed data
+
+```{r}
+# The log-count assay was only used for QC plots; drop it before saving
+data_t0t1[["log_assay"]] <- NULL
+saveRDS(
+  data_t0t1,
+  file = here("mpx", "rdata", "robj_suzuki_cart_processed_data_t0t1.rds")
+)
+```
+
+
+
+## Timecourse: Donor 32
+
+
+First we will subset the data to only contain the Donor 32 samples, across all timepoints.
+
+```{r}
+data_d32 <- data_combined_filt |>
+  subset(donor %in% c("donor_32"))
+```
+
+\
+
+### CLR normalization
+
+As before, normalization is done using the CLR approach.
+
+```{r}
+data_d32 <- data_d32 |>
+  NormalizeMPX(method = "clr") |>
+  ScaleData()
+```
+
+\
+
+### Figures
+
+Let's have a look at our FMC63+/- status that was based on counts. We'll also make a new column for FMC63 status based on CLR.
+
+```{r}
+# FMC63 status on CLR values: >= 1.5 at t0 (CAR-T product), >= 0 at later timepoints.
+# If changed, update the Details section too.
+fmc63_cutoff_clr_t0 <- 1.5
+fmc63_cutoff_clr <- 0
+data_d32[["FMC63_clr"]] <- FetchData(data_d32, vars = "FMC63", layer = "data")
+data_d32[[]] <- data_d32[[]] |>
+  mutate(
+    FMC63_status_clr = ifelse(
+      FMC63_clr >=
+        ifelse(timepoint == "t0", fmc63_cutoff_clr_t0, fmc63_cutoff_clr),
+      "FMC63+",
+      "FMC63-"
+    )
+  )
+```
+
+```{r fig.width=12, fig.height=4}
+p1 <- VlnPlot(
+  data_d32,
+  features = "FMC63",
+  group.by = "type",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  scale_fill_manual(values = pal_samples) &
+  theme_violin() &
+  geom_hline(yintercept = c(0), linewidth = 0.25, linetype = "dashed") &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 abundance (CLR)")
+
+p2 <- VlnPlot(
+  data_d32,
+  features = "FMC63",
+  group.by = "FMC63_status",
+  split.by = "sample",
+  pt.size = 0.01,
+  cols = pal_samples
+) &
+  scale_fill_manual(values = pal_samples) &
+  theme_violin() &
+  theme(legend.position = "none") &
+  labs(y = "FMC63 abundance (CLR)", title = "FMC63 status based on counts")
+
+p3 <- VlnPlot(
+  data_d32,
+  features = "FMC63",
+  group.by = "FMC63_status_clr",
+  split.by = "sample",
+  pt.size = 0.01
+) &
+  scale_fill_manual(values = pal_samples) &
+  theme_violin() &
+  theme(legend.position = "right") &
+  labs(y = "FMC63 abundance (CLR)", title = "FMC63 status based on CLR")
+
+p <- p1 | p2 | p3
+p
+
+pdf(
+  here("mpx", "results", "processed", "d32_marker_fmc63_violin.pdf"),
+  width = 12,
+  height = 4
+)
+p
+dev.off()
+```
+
+### PCA & UMAP
+
+Perform PCA and look at the variance explained by each component. 
+
+```{r fig.width=6, fig.height=4}
+data_d32 <- data_d32 |>
+  RunPCA()
+
+ElbowPlot(data_d32, ndims = 30)
+```
+
+```{r fig.width=10, fig.height=14}
+DimHeatmap(data_d32, dims = 1:18, cells = 500, balanced = TRUE, ncol = 3)
+```
+
+```{r}
+n_dims <- 14
+data_d32 <- data_d32 |>
+  RunUMAP(reduction = "pca", dims = 1:n_dims, reduction.name = "umap.pca")
+```
+
+
+
+```{r fig.width=10, fig.height=5}
+pt_size <- 0.5
+p1 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.pca",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.pca",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- (p1 | p2)
+p
+pdf(
+  here("mpx", "results", "processed", "d32_pca_umap_dimplot.pdf"),
+  width = 10,
+  height = 5
+)
+p
+dev.off()
+```
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.pca",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p2 <- FeaturePlot(
+  object = data_d32,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.pca",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+pdf(
+  here("mpx", "results", "processed", "d32_pca_umap_featureplot.pdf"),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+\
+
+### Harmony & UMAP
+
+Let's proceed with performing integration of data by harmonizing the PCs by sample.
+
+```{r}
+integrate_by <- "sample"
+
+data_d32 <- data_d32 |>
+  RunHarmony(
+    group.by.vars = integrate_by,
+    plot_convergence = FALSE
+  ) |>
+  RunUMAP(
+    reduction = "harmony",
+    dims = 1:n_dims,
+    reduction.name = "umap.harmony"
+  )
+```
+
+
+```{r fig.width=20, fig.height=5}
+p1 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.pca",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Original UMAP") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Harmonized UMAP") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p <- (p1 | p2 | p3)
+p
+pdf(
+  here("mpx", "results", "processed", "d32_pca_harmony_umap_dimplot.pdf"),
+  width = 25,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+p1 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p2 <- FeaturePlot(
+  object = data_d32,
+  features = c("FMC63", "CD3E", "CD4", "CD8"),
+  ncol = 4,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  slot = "data",
+  # min.cutoff = -2,
+  # max.cutoff = 5,
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+p <- (p1 | p2) + plot_layout(widths = c(1, 5))
+p
+
+pdf(
+  here("mpx", "results", "processed", "d32_pca_harmony_umap_featureplot.pdf"),
+  width = 20,
+  height = 5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=20, fig.height=5}
+pt_size <- 0.5
+
+FeaturePlot(
+  object = data_d32,
+  features = c("CD19", "CD20", "CD14", "CD335", "CD41"),
+  ncol = 5,
+  reduction = "umap.harmony",
+  cols = gradient_color,
+  slot = "data",
+  pt.size = pt_size
+) &
+  theme(legend.position = "bottom", aspect.ratio = 1)
+```
+
+\
+
+### Clustering
+
+#### Generate cell clusters
+
+```{r}
+cluster_res <- 0.4
+
+data_d32 <- data_d32 |>
+  FindNeighbors(dims = 1:n_dims, reduction = "harmony") |>
+  FindClusters(resolution = cluster_res)
+```
+
+
+```{r fig.width=6, fig.height=5}
+DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "seurat_clusters",
+  cols = cell_palette_unsorted,
+  pt.size = pt_size
+) +
+  theme(legend.position = "right", aspect.ratio = 1)
+```
+
+\
+
+#### Find cluster marker proteins
+
+```{r}
+DE_cluster_d32 <-
+  data_d32 %>%
+  FindAllMarkers(
+    test.use = "wilcox",
+    assay = "mpxCells",
+    slot = "data",
+    logfc.threshold = 0,
+    return.thresh = 1,
+    mean.fxn = rowMeans,
+    fc.name = "difference"
+  ) %>%
+  as_tibble()
+```
+
+```{r}
+DE_cluster_d32 |>
+  filter(p_val_adj < 0.01, difference > 0) |>
+  group_by(cluster) |>
+  slice_max(order_by = difference, n = 10) |>
+  relocate(gene) |>
+  display_dt(rownames = FALSE)
+# knitr::kable("simple")
+```
+
+
+Plot top markers per cluster.
+
+```{r fig.width = 20, fig.height=8}
+markers_plot <- DE_cluster_d32 |>
+  filter(p_val_adj < 0.01, difference > 0) |>
+  group_by(cluster) |>
+  slice_max(order_by = difference, n = 3) |>
+  pull(gene)
+
+markers_plot <- c(
+  "CD3E",
+  "CD2",
+  markers_plot,
+  "CD337",
+  "CD19",
+  "CD20",
+  "FMC63"
+) |>
+  unique()
+
+VlnPlot(
+  data_d32,
+  group.by = "seurat_clusters",
+  features = markers_plot,
+  pt.size = 0,
+  ncol = 6,
+  cols = cell_palette_unsorted
+) &
+  geom_hline(yintercept = 0, linewidth = 0.25, color = "black") &
+  theme_violin() &
+  NoLegend()
+```
+
+```{r fig.width=16, fig.height=4}
+lim_break <- 3
+
+DE_cluster_d32 %>%
+  group_by(gene) %>%
+  filter(
+    any(
+      p_val_adj < 0.01 &
+        abs(difference) > 0.25
+    )
+  ) %>%
+  select(difference, cluster, gene) %>%
+  tidyr::unite("population", cluster, sep = " ") |>
+  pivot_wider(names_from = "population", values_from = "difference") %>%
+  column_to_rownames("gene") %>%
+  replace(is.na(.), 0) %>%
+  # clipr::write_clip(allow_non_interactive = TRUE) |> # copies the table to the clipboard; disabled for rendering
+  t() |>
+  pheatmap::pheatmap(
+    cellwidth = 10,
+    cellheight = 10,
+    breaks = seq(-lim_break, lim_break, 0.1),
+    color = differential_pal(length(seq(-lim_break, lim_break, 0.1))),
+    border_color = "white",
+    border_width = 0.001,
+    width = 12
+  ) -> cluster_heatmap
+```
+
+\
+
+#### Annotate cell clusters
+
+```{r}
+# marker_list <- list(
+#   B = c("CD19", "CD20", "CD22"),
+#   CD4T = c("CD4"),
+#   CD8T = c("CD8"),
+#   gdT = c("TCRVd2", "TCRVg9"),
+#   NK = c("NKp80", "CD94", "CD158", "CD335", "CD337"),
+#   Myeloid = c("CD64", "CD93"),
+#   Mono = c("CD11c", "CD14", "CD45"),
+#   Neutrophils = c("CD66b", "CD10", "CD11b"),
+#   Basophils = c("IgE", "CD193"),
+#   Platelets = c("CD41", "CD62P")
+# )
+```
+
+```{r}
+data_d32[[]] <- data_d32[[]] |>
+  mutate(
+    cluster_annotated = case_when(
+      # seurat_clusters %in% c() ~ "B",
+      seurat_clusters %in% c(6) ~ "CD4 T",
+      seurat_clusters %in% c(0) ~ "CD4 T FMC63hi",
+      seurat_clusters %in% c(5) ~ "CD8 T", # mixed CD8 T / NK, annotated as CD8 T (gating separates the T cells)
+      seurat_clusters %in% c(1, 3) ~ "CD8 T FMC63hi",
+      seurat_clusters %in% c(8) ~ "Other T",
+      seurat_clusters %in% c(2) ~ "Platelets",
+      seurat_clusters %in% c(4, 7) ~ "Myeloid"
+      # seurat_clusters %in% c() ~ "Mono",
+      # seurat_clusters %in% c() ~ "Neutrophils",
+      # seurat_clusters %in% c() ~ "Basophils",
+      # seurat_clusters %in% c() ~ "other", #
+    )
+    # Previous mapping, used for the objects saved on 2025-10-02 (before the
+    # 2026-09-30 updates: isotype filter, gating and FMC63 cutoff). The clusters were
+    # renumbered when re-run, so these cluster numbers no longer apply:
+    # cluster_annotated = case_when(
+    #   seurat_clusters %in% c(5) ~ "CD4 T",
+    #   seurat_clusters %in% c(0) ~ "CD4 T FMC63hi",
+    #   seurat_clusters %in% c(6) ~ "CD8 T",
+    #   seurat_clusters %in% c(1, 3) ~ "CD8 T FMC63hi",
+    #   seurat_clusters %in% c(8) ~ "Other T",
+    #   seurat_clusters %in% c(7) ~ "NK",
+    #   seurat_clusters %in% c(2) ~ "Platelets",
+    #   seurat_clusters %in% c(4, 9) ~ "Myeloid"
+    # )
+  ) |>
+  mutate(cluster_annotated_2 = paste0(seurat_clusters, "_", cluster_annotated))
+
+data_d32$cluster_annotated_broad <- ifelse(
+  data_d32$cluster_annotated %in% c("CD4 T FMC63hi"),
+  "CD4 T",
+  ifelse(
+    data_d32$cluster_annotated %in% c("CD8 T FMC63hi"),
+    "CD8 T",
+    data_d32$cluster_annotated
+  )
+)
+
+data_d32$cluster_annotated_fmc <- ifelse(
+  data_d32$cluster_annotated_broad %in%
+    c("CD4 T", "CD8 T") &
+    data_d32$FMC63_status_clr == "FMC63+",
+  paste0(data_d32$cluster_annotated_broad, " ", data_d32$FMC63_status_clr),
+  data_d32$cluster_annotated_broad
+)
+```
+
+
+\
+
+#### Gating (NEW)
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_d32$cluster_annotated_fmc |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_d32, cluster_annotated_fmc %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "cluster_annotated_fmc"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_d32, cluster_annotated_fmc %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "cluster_annotated_fmc"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here("mpx", "results", "processed", "d32_tcell_markers_density_plot.pdf"),
+  width = 10,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+Next we gate the cells in the CD4 and CD8 T cell clusters on their CD3E, CD4 and CD8 abundance (CLR) to clean up the populations. Cells with CD3E > `cutoff_cd3` are T cells; CD4 > `cutoff_cd4` with CD8 < `cutoff_cd8` gives CD4 T cells, and CD4 < `cutoff_cd4` with CD8 > `cutoff_cd8` gives CD8 T cells. Any other T cell (double negative or double positive) is labelled "Other T", and cells with CD3E <= `cutoff_cd3` are labelled "other". CD4 and CD8 T cells are then split by FMC63 status (`FMC63_status_clr`). Cells in all other clusters keep their cluster label.
+
+```{r}
+# Gating of the cells in CD4/CD8 T cell clusters on CLR values.
+# If a cutoff is changed, update the Details section too.
+cutoff_cd3 <- 1
+cutoff_cd4 <- 1
+cutoff_cd8 <- 2
+
+gating_data <- FetchData(
+  data_d32,
+  vars = c("CD3E", "CD4", "CD8"),
+  layer = "data"
+)
+gating_data$tcell_gated <- case_when(
+  gating_data$CD3E > cutoff_cd3 &
+    gating_data$CD4 > cutoff_cd4 &
+    gating_data$CD8 < cutoff_cd8 ~ "CD4 T",
+  gating_data$CD3E > cutoff_cd3 &
+    gating_data$CD4 < cutoff_cd4 &
+    gating_data$CD8 > cutoff_cd8 ~ "CD8 T",
+  # Any other CD3+ cell: CD4- CD8- (double negative) or CD4+ CD8+ (double positive)
+  gating_data$CD3E > cutoff_cd3 ~ "Other T",
+  TRUE ~ "other"
+)
+
+data_d32 <- AddMetaData(data_d32, gating_data |> select(tcell_gated))
+```
+
+
+```{r fig.width=10, fig.height=7}
+celltypes_plot <- grep(
+  "CD",
+  data_d32$cluster_annotated_fmc |> unique(),
+  value = T
+)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_d32, cluster_annotated_fmc %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "tcell_gated"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_d32, cluster_annotated_fmc %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "tcell_gated"
+)
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "d32_tcell_markers_density_plot_gated.pdf"
+  ),
+  width = 10,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+
+Finally, let's create new updated population labels.
+
+```{r}
+#' Create new labels: cells in CD4/CD8 T cell clusters get their gated label (CD4 and CD8 T
+#' cells split by FMC63 status); all other cells keep their cluster label.
+#' FMC63- CD4/CD8 T cells are labelled "CD4 T" / "CD8 T".
+mdat_add <- data_d32@meta.data |>
+  mutate(
+    celltype = case_when(
+      !cluster_annotated_broad %in% c("CD4 T", "CD8 T") ~ cluster_annotated_fmc,
+      tcell_gated %in% c("CD4 T", "CD8 T") ~ paste0(
+        tcell_gated,
+        " ",
+        FMC63_status_clr
+      ),
+      TRUE ~ tcell_gated
+    ),
+    celltype = gsub(" FMC63-", "", celltype),
+    celltype_broad = gsub(" FMC63\\+", "", celltype)
+  ) |>
+  select(celltype, celltype_broad)
+
+#' Add new metadata cell label column to data object
+data_d32 <- AddMetaData(data_d32, mdat_add)
+```
+
+
+```{r fig.width=16, fig.height=7}
+celltypes_plot <- grep("^CD", data_d32$celltype |> unique(), value = T)
+markers_plot <- c("CD4", "CD8", "FMC63")
+
+p_list <- lapply(markers_plot, function(m) {
+  p <- DensityScatterPlot(
+    subset(data_d32, celltype %in% celltypes_plot),
+    pt_size = 0.5,
+    layer = "data",
+    marker1 = "CD3E",
+    marker2 = m,
+    facet_vars = "celltype"
+  )
+  return(p)
+})
+p_list[[4]] <- DensityScatterPlot(
+  subset(data_d32, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "CD8",
+  facet_vars = "celltype"
+)
+
+p_list[[5]] <- DensityScatterPlot(
+  subset(data_d32, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD4",
+  marker2 = "FMC63",
+  facet_vars = "celltype"
+)
+
+p_list[[6]] <- DensityScatterPlot(
+  subset(data_d32, celltype %in% celltypes_plot),
+  pt_size = 0.5,
+  layer = "data",
+  marker1 = "CD8",
+  marker2 = "FMC63",
+  facet_vars = "celltype"
+)
+
+
+p <- Reduce("|", p_list) &
+  theme_linedraw() &
+  theme(panel.grid = element_blank())
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "d32_tcell_markers_density_plot_celltype_updated.pdf"
+  ),
+  width = 16,
+  height = 7
+)
+p
+dev.off()
+```
+
+
+\
+
+#### Cell cluster figures
+
+
+
+**UMAP**
+
+```{r fig.width=18, fig.height=15}
+p1 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p2 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "cluster_annotated_2",
+  cols = cell_palette_unsorted,
+  pt.size = pt_size
+) +
+  labs(title = "Annotated clusters (fine-grained)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p3 <- DimPlot(
+  object = data_d32,
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Updated clusters with gating") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p4 <- DimPlot(
+  object = data_d32 |> subset(celltype != "discard"),
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(title = "Updated clusters with gating") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p5 <- DimPlot(
+  object = data_d32 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "FMC63_status_clr",
+  cols = fmc_status_col,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p6 <- FeaturePlot(
+  object = data_d32 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  features = "FMC63",
+  slot = "data",
+  cols = c("#E5E5E5", "#A64463"),
+  min.cutoff = -1,
+  pt.size = pt_size
+) +
+  labs(title = "FMC63 abundance (CLR)") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p7 <- DimPlot(
+  object = data_d32 |> subset(celltype != "discard"),
+  reduction = "umap.harmony",
+  group.by = "sample",
+  cols = pal_samples,
+  pt.size = pt_size
+) +
+  labs(title = "Sample") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p8 <- DimPlot(
+  object = data_d32 |> subset(celltype != "discard"),
+  reduction = "umap.harmony",
+  group.by = "donor",
+  cols = pal_donor,
+  pt.size = pt_size
+) +
+  labs(title = "Donor") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+p9 <- DimPlot(
+  object = data_d32 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "timepoint",
+  cols = pal_time,
+  pt.size = pt_size
+) +
+  labs(title = "Time point") +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+
+p <- ((p1 | p2 | p3) / (p4 | p5 | p6) / (p7 | p8 | p9)) &
+  theme_umap() &
+  labs(x = "UMAP 1", y = "UMAP 2")
+p
+
+# pdf(here("mpx", "results", "processed", "d32_pca_harmony_umap_cluster_annotation.pdf"), width = 18, height = 15);p;dev.off()
+```
+
+
+
+```{r fig.width=10, fig.height=4}
+p <- DimPlot(
+  object = data_d32 |> subset(!celltype == "discard"),
+  reduction = "umap.harmony",
+  group.by = "celltype",
+  split.by = "timepoint",
+  cols = cell_palette,
+  pt.size = pt_size
+) +
+  labs(
+    title = "Cell type annotations with FMC63 status",
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  theme_umap(legend.pos = "bottom")
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "d32_pca_harmony_umap_cluster_annotation_split_time.pdf"
+  ),
+  width = 10,
+  height = 4
+)
+p
+dev.off()
+```
+
+
+
+\
+
+**Fraction of FMC63+/- cells across populations**
+
+For every cell type, visualize the proportion of FMC63+/- cells.
+
+```{r fig.width=12, fig.height=4}
+time_plot <- data_d32$timepoint |> unique()
+
+p_list <- lapply(time_plot, function(tp) {
+  CellCountPlot(
+    data_d32 |> subset(timepoint == tp),
+    color_by = "FMC63_status_clr",
+    group_by = "celltype_broad",
+    as_frequency = F,
+    show_count = T,
+    stack = T
+  ) &
+    scale_fill_manual(values = fmc_status_col) &
+    labs(fill = "", title = tp) &
+    theme_linedraw(base_size = 14) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        panel.grid = element_blank(),
+        panel.border = element_rect(
+          color = "black",
+          fill = NA,
+          linewidth = 0.5
+        ),
+        legend.position = "top"
+      )
+})
+
+Reduce(`|`, p_list)
+```
+
+```{r fig.width=6, fig.height=3}
+VlnPlot(
+  data_d32,
+  features = "FMC63",
+  split.by = "celltype",
+  group.by = "timepoint",
+  pt.size = 0.01
+) &
+  scale_fill_manual(values = cell_palette) &
+  geom_hline(yintercept = 0, linewidth = 0.25) &
+  labs(
+    y = "FMC63 abundance (CLR)",
+    title = "FMC63 levels across cell populations and timepoints"
+  ) &
+  theme_violin() &
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.text = element_text(size = 11)
+  )
+```
+
+\
+
+
+**Cell type proportions**
+
+First we need to compute the cell type frequencies across samples.
+
+
+```{r}
+cellcluster_freq_tbl <- data_d32@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  group_by(sample, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(celltype = as.factor(celltype))
+
+cellcluster_freq_tbl |> display_dt(rownames = FALSE)
+```
+
+
+```{r fig.width=6, fig.height=4}
+#' Plot per timepoint
+p <- ggplot(cellcluster_freq_tbl, aes(y = pct, x = timepoint)) +
+  geom_alluvium(
+    aes(alluvium = celltype, fill = celltype),
+    alpha = .3,
+    color = "black"
+  ) +
+  geom_col(aes(fill = celltype), width = .4, color = "black") +
+  scale_fill_manual(values = cell_palette) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(scale = 1)
+  ) +
+  labs(
+    y = "Cell type proportion (%)",
+    x = "Timepoint",
+    fill = "Cell type",
+    title = "Donor 32"
+  ) +
+  cowplot::theme_minimal_hgrid() +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+
+pdf(
+  here("mpx", "results", "processed", "d32_cell_cluster_proportion_flow.pdf"),
+  width = 6,
+  height = 4
+)
+p
+dev.off()
+```
+
+\
+
+**FMC63+ fractions in T cells**
+
+Plot FMC63+ fraction in CD4/CD8 T cells
+
+```{r}
+#' Use this if you want to compute the percentage vs the total cell (or total T cell) population
+sample_tcell_count_all <- data_d32@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  # filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample) |>
+  summarize(n_cells_total = n())
+
+sample_tcell_count <- data_d32@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample, celltype_broad) |>
+  summarize(n_cells_tcell = n()) |>
+  mutate(sample_cluster = paste0(sample, "_", celltype_broad)) |>
+  ungroup() |>
+  select(sample_cluster, n_cells_tcell)
+
+sample_tcell_tot_count <- data_d32@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  mutate(
+    celltype_tcell = ifelse(
+      celltype_broad %in% c("CD4 T", "CD8 T"),
+      "T cell",
+      "other"
+    )
+  ) |>
+  filter(celltype_tcell %in% c("T cell")) |>
+  group_by(sample) |>
+  summarize(n_cells_tcell_tot = n()) |>
+  ungroup() |>
+  select(sample, n_cells_tcell_tot)
+
+#'
+cellcluster_fmc_freq_tbl <- data_d32@meta.data |>
+  filter(!celltype == "discard") |>
+  filter(!celltype == "Platelets") |>
+  filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+  group_by(sample, celltype_broad, FMC63_status_clr) |>
+  summarize(n_cells = n()) |>
+  merge(sample_tcell_count_all, by = "sample") |>
+  mutate(sample_cluster = paste0(sample, "_", celltype_broad)) |>
+  merge(sample_tcell_count, by = "sample_cluster") |>
+  merge(sample_tcell_tot_count, by = "sample") |>
+  mutate(fraction_total_cells = n_cells / n_cells_total) |> # Use this if you want to compute the percentage vs the total cell population
+  mutate(fraction_total_tcells = n_cells / n_cells_tcell) |> # Use this if you want to compute the percentage vs respective CD4/CD8 population
+  mutate(fraction_total_tcells_all = n_cells / n_cells_tcell_tot) |> # Use this if you want to compute the percentage vs the total T cell population
+  # mutate(fraction_total_subtcell = n_cells / sum(n_cells)) |>  # Use this if you want to compute the percentage vs all cells
+  # mutate(pct = round(fraction, 3)*100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(
+    celltype_broad = as.factor(celltype_broad),
+    FMC63_status_clr = as.factor(FMC63_status_clr)
+  )
+
+cellcluster_fmc_freq_tbl |> display_dt(rownames = FALSE) #knitr::kable()
+```
+
+
+```{r fig.width=3.5, fig.height=3.5}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_tcells * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective\nsample's CD4 or CD8 T cell population"
+  ) +
+  ylim(0, 100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "d32_cell_cluster_fmc63_tcell_pct_line.pdf"
+  ),
+  width = 3.5,
+  height = 3.5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=3.5, fig.height=3.5}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_tcells_all * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective\nsample's total T cell population"
+  ) +
+  ylim(0, 100) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "d32_cell_cluster_fmc63_tcell_all_pct_line.pdf"
+  ),
+  width = 3.5,
+  height = 3.5
+)
+p
+dev.off()
+```
+
+
+```{r fig.width=3.5, fig.height=3.5}
+p <- ggplot(
+  cellcluster_fmc_freq_tbl |>
+    filter(celltype_broad %in% c("CD4 T", "CD8 T")) |>
+    filter(FMC63_status_clr == "FMC63+") |>
+    mutate(donor = gsub("^d", "D", gsub("_", " ", donor))),
+  aes(
+    x = timepoint,
+    y = fraction_total_cells * 100,
+    color = celltype_broad,
+    group = celltype_broad
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cell_palette) +
+  labs(
+    y = "Fraction of\nFMC63+ cells (%)",
+    color = "T cell",
+    caption = "Percentage of FMC63+ cells within respective\nsample's total cell population"
+  ) +
+  ylim(0, 40) +
+  facet_wrap(~donor) +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  theme_linedraw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text = element_text(color = "black", face = "bold", size = 11),
+    legend.position = "bottom",
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11)
+  )
+p
+
+pdf(
+  here(
+    "mpx",
+    "results",
+    "processed",
+    "d32_cell_cluster_fmc63_total_pct_line.pdf"
+  ),
+  width = 3.5,
+  height = 3.5
+)
+p
+dev.off()
+```
+
+\
+
+### Export processed data
+
+```{r}
+# The log-count assay was only used for QC plots; drop it before saving
+data_d32[["log_assay"]] <- NULL
+saveRDS(
+  data_d32,
+  file = here("mpx", "rdata", "robj_suzuki_cart_processed_data_d32.rds")
+)
+```
+
+
+\
+
+## Comparison of cluster annotations
+
+Compare cell cluster labels between the three clustering approaches. How consistent are cell identity labels?
+
+
+# Conclusion
+
+## Export data
+
+```{r}
+#| eval: false
+#| 
+#' Save entire workspace (for reproducibility in case something needs to be replotted)
+# save.image(here("mpx", "rdata", "workspace_suzuki_cart_script01_2025-10-01.RData"))
+# load(here("mpx", "rdata", "workspace_suzuki_cart_script01_2025-10-01.RData"))
+```
+
+## Session information
+
+```{r}
+sessionInfo()
+```

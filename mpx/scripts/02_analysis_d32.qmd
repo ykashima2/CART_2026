@@ -1,0 +1,1042 @@
+---
+title: "Suzuki -- CAR-T clinical study -- Analysis: Donor 32 time-course"
+subtitle: "Pixelgen MPX data analysis"
+author: "Lovisa Franzén"
+date: "2025-10-01"
+output: html_document
+format:
+  html:
+    theme: default
+    page-layout: full
+    code_folding: show
+    embed-resources: true
+    toc: true
+    toc-location: right
+    toc-depth: 5
+---
+
+
+# Details
+
+## Script information
+
+In this notebook, we continue after the data processing (`01_processing_all.qmd`) and cover the downstream analysis that follows for the data group that includes the full **donor 32** subset of the data. This includes:
+
+-   Perform analyses focused on CAR-T cells over all time points (t0-t3)
+-   Address questions related to: a) How do T cells change over time (both CAR+ and CAR-) following CAR-T infusion?
+
+
+\
+
+## Study and experimental outline
+
+Study led by Prof. Suzuki Yutaka and Dr. Kashima Yukie (Tokyo University, Japan). Samples collected from three donors (32, 44, 50) that have received CAR-T treatment. The CAR-T product was analyzed before infusion, and thereafter, PBMC samples were collected days post infusion (DPI) (8-9, 13, and 24 days).
+
+Here, we will focus on the donor 32 time course samples (CAR-T product, 8 dpi, 13 dpi, and 24 dpi samples).
+
+```{r echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+sample_table <- "
+|  Sample ID    |  Donor ID   | Sample type  | DPI  |
+|:-------------:|:-----------:|:------------:|:----:|
+| TKB_CAR_T_64  | 32          | CAR-T prod.  |  --  |
+| TKB_CAR_T_73  | 32          | PBMC         |  d8  |
+| TKB_CAR_T_79  | 32          | PBMC         |  d13 |
+| TKB_CAR_T_84  | 32          | PBMC         |  d24 |
+"
+cat(sample_table)
+```
+
+\
+
+# Setup
+
+## Libraries, parameters, and functions
+
+```{r general_def, message=FALSE}
+#| code-fold: true
+set.seed(1)
+here::i_am("scripts/02_analysis_d32.qmd")
+
+png_res <- 300
+```
+
+```{r message=FALSE}
+#| code-fold: true
+#| output: false
+
+fn_sources <- list.files(
+  here::here("scripts", "R"),
+  pattern = "*.R$",
+  full.names = TRUE
+)
+
+sapply(fn_sources, source, .GlobalEnv)
+```
+
+
+```{r message=FALSE}
+#| code-fold: true
+load_packages(
+  c(
+    "dplyr",
+    "tidyr",
+    "ggplot2",
+    "patchwork",
+    "pixelatorR",
+    "Seurat",
+    "readr",
+    "ggrepel",
+    "harmony",
+    "here",
+    "stringr",
+    "tibble",
+    "ComplexHeatmap",
+    "glue",
+    "conflicted",
+    "gt"
+  )
+)
+
+library(ggbeeswarm)
+library(quartabs)
+library("ggvenn")
+
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+```
+
+```{r}
+#| code-fold: true
+display_dt <- function(x, rows_per_page = 15, ...) {
+  DT::datatable(
+    x,
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+      lengthMenu = list(c(10, 25, 50, -1), c(10, 25, 50, "All")),
+      pageLength = rows_per_page
+    ),
+    ...
+  )
+}
+```
+
+
+## Read data
+
+We will continue to work from the data object that we created in the first processing script. This includes all the necessary information we need to continue the analysis here.
+
+```{r}
+data_d32 <- readRDS(here("rdata", "robj_suzuki_cart_processed_data_d32.rds"))
+```
+
+
+Update filtering of data to exclude cells flagged as "discard" and "other".
+
+```{r}
+data_d32 <- data_d32 |>
+  subset(celltype != c("discard", "other"))
+
+data_d32
+# head(data_d32@meta.data)
+```
+
+```{r}
+data_d32$cell_broad_time <- paste0(
+  data_d32$celltype_broad,
+  " ",
+  data_d32$timepoint
+)
+data_d32$cell_fmc63_time <- paste0(data_d32$celltype, " ", data_d32$timepoint)
+```
+
+
+```{r}
+samples <- data_d32$sample |> as.character() |> unique()
+DIR_DATA <- "/Users/lovisafransen/Documents/Analysis/data/Suzuki_JPN_2025"
+mdat_df <- read.table(
+  file.path(DIR_DATA, "sample_metadata.tsv"),
+  sep = "\t",
+  header = T
+) |>
+  filter(sample %in% samples)
+```
+
+
+
+# Analysis
+
+For this analysis we are focusing on the donor 32 samples, that have samples covering four different time points (pre- and post-infusion). Thus, we will here look at the CAR-T cells and regular T cells to see how they behave over time, following CAR-T treatment in the patients.
+
+
+For this downstream analysis we will aim to cover:
+
+- Looking at T cell differences across time points (CAR+ when possible, otherwise the ordinary PBMC CD4/CD8 T cell populations)
+
+
+## Overview
+
+```{r}
+cellcluster_freq_tbl <- data_d32@meta.data |>
+  filter(!celltype == c("discard", "other")) |>
+  filter(!celltype == "Platelets") |>
+  group_by(sample, celltype) |>
+  summarize(n_cells = n()) |>
+  mutate(fraction = n_cells / sum(n_cells)) |>
+  mutate(pct = round(fraction, 3) * 100) |>
+  merge(mdat_df, by = "sample") |>
+  mutate(celltype = as.factor(celltype))
+
+cellcluster_freq_tbl |> display_dt(rownames = FALSE)
+```
+
+
+\
+
+## Abundance
+
+### Differential abundance
+
+Perform differential abundance tests between t2 or t3 and t1. As we have too few of the FMC63+ cells for the later time points, we will instead focus on the regular T cell populations.
+
+```{r}
+groups_test <- grep("^CD", data_d32$celltype |> unique(), value = T) # c("CD4 T", "CD8 T")
+groups_test <- grep("T$", groups_test, value = T)
+
+tp_test <- paste0("t", 1:3)
+
+#' Prepare data
+dat_test <- data_d32 |>
+  subset(celltype %in% groups_test & timepoint %in% tp_test)
+
+#' Collect info about number of cells per group
+daa_cell_stats <- dat_test[[]] |>
+  rename(celltype = "celltype") |>
+  group_by(celltype, donor, timepoint) |>
+  summarize(n_cells = n())
+
+daa_cell_stats |> knitr::kable()
+```
+
+
+```{r}
+#' Run differential abundance test
+daa_res <- RunDAA(
+  dat_test,
+  contrast_column = "timepoint",
+  reference = "t1",
+  targets = c("t2", "t3"),
+  group_vars = "celltype"
+)
+
+daa_res <- daa_res |>
+  rename(celltype = "celltype") |>
+  relocate(celltype) |>
+  relocate(difference, .before = p) |>
+  mutate(sign = ifelse(p_adj < 0.01, "sign.", "n.s"))
+```
+
+```{r}
+#' View results
+display_dt(daa_res, rownames = FALSE)
+```
+
+
+```{r}
+daa_res_sign <- daa_res |>
+  mutate(contrast = paste0(target, "_vs_", reference)) |>
+  mutate(cell_contrast = paste0(celltype, "_", contrast)) |>
+  arrange(cell_contrast) |>
+  filter(p_adj < 0.01)
+```
+
+```{r}
+#' View significant results
+display_dt(daa_res_sign |> relocate(cell_contrast), rownames = FALSE)
+```
+
+```{r}
+dap_list <- daa_res_sign |>
+  group_by(cell_contrast) |>
+  group_map(~ .x$marker)
+
+names(dap_list) <- daa_res_sign$cell_contrast |> unique()
+
+dap_list
+```
+
+These results are based on all available proteins, without any pre-filtering on ensuring high and robust abundance across the tested populations. When looking at and visualizing the results themselves, we can add some additional filtering to only look at proteins that show an average abundance value of CLR > 0 for at least one of the groups in the comparison.  
+
+
+### Visualizations
+
+**Volcano plot**
+
+```{r fig.width=10, fig.height=8}
+p <- ggplot(daa_res, aes(x = difference, y = -log10(p_adj), color = sign)) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  geom_vline(xintercept = c(-1, 1), col = "grey") +
+  geom_point() +
+  scale_color_manual(values = c("grey80", "black")) +
+  facet_wrap(target ~ celltype, scales = "free_y") +
+  coord_cartesian(
+    xlim = c(1.1 * min(daa_res$difference), 1.1 * max(daa_res$difference))
+  ) +
+  theme_linedraw() +
+  geom_text(
+    aes(label = ifelse(abs(difference) > 0.5, as.character(marker), '')),
+    hjust = -0.2,
+    vjust = 0
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.position = "none",
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    strip.text = element_text(size = 12)
+  )
+p
+
+pdf(
+  here("results", "analysis_d32", "abundance_daa_volcano_tcells.pdf"),
+  width = 10,
+  height = 8
+)
+p
+dev.off()
+```
+
+**Venn**
+
+```{r fig.width=8, fig.height=3}
+fill_cols <- cell_palette[c("CD4 T", "CD8 T")] |> as.character()
+p1 <- ggvenn(
+  dap_list[1:2],
+  fill_color = pal_time[c(3, 4)],
+  stroke_size = 0.5,
+  set_name_size = 4
+)
+p2 <- ggvenn(
+  dap_list[3:4],
+  fill_color = pal_time[c(3, 4)],
+  stroke_size = 0.5,
+  set_name_size = 4
+)
+
+p <- p1 | p2
+p
+pdf(
+  here("results", "analysis_d32", "abundance_daa_venn_tcells.pdf"),
+  width = 8,
+  height = 3
+)
+p
+dev.off()
+```
+
+**Heatmap - abundant markers**
+
+```{r}
+dat_test$sample_cell <- paste0(
+  dat_test$celltype,
+  "_",
+  dat_test$donor,
+  "_",
+  dat_test$timepoint
+)
+
+annotation_row <- dat_test[[]] |>
+  select(sample_cell, celltype, timepoint) |>
+  distinct() |>
+  as.tibble() |>
+  as.data.frame() |>
+  column_to_rownames("sample_cell")
+
+ann_colors <- list(
+  celltype = cell_palette[groups_test],
+  timepoint = setNames(pal_time, nm = paste0("t", 0:3))[2:4]
+)
+```
+
+\
+
+CD4 T cells:
+
+```{r}
+cd4_markers <- list(
+  t2_vs_v1 = dap_list[["CD4 T_t2_vs_t1"]],
+  t3_vs_v1 = dap_list[["CD4 T_t3_vs_t1"]]
+)
+```
+
+```{r fig.width=10, fig.height=3}
+markers_select <- cd4_markers |> unlist() |> unique()
+
+pdat <- FetchData(
+  dat_test,
+  vars = c("sample_cell", markers_select),
+  layer = "data"
+) %>%
+  group_by(sample_cell) %>%
+  summarise_all(mean) %>%
+  column_to_rownames("sample_cell")
+
+# Filter plot data to only contain CD4 T cells and markers where mean CLR abundance > 0
+pdat <- pdat[grep("CD4", rownames(pdat), value = T), ]
+
+cols_select_mean_t1 <- grep("_t1", rownames(pdat), value = T)
+cols_select_mean_t2 <- grep("_t2", rownames(pdat), value = T)
+cols_select_mean_t3 <- grep("_t3", rownames(pdat), value = T)
+
+marker_means <- c(
+  colMeans(pdat[cols_select_mean_t1, ]),
+  colMeans(pdat[cols_select_mean_t2, ]),
+  colMeans(pdat[cols_select_mean_t3, ])
+)
+pdat <- pdat[, marker_means[marker_means > 0] |> names() |> unique()]
+
+row_order <- annotation_row[rownames(pdat), ] |>
+  arrange(celltype, timepoint) |>
+  rownames()
+
+# Plot
+pdat[row_order, ] |>
+  pheatmap::pheatmap(
+    cellwidth = 14,
+    cellheight = 14,
+    fontsize = 12,
+    treeheight_col = 10,
+    treeheight_row = 10,
+    border_color = "white",
+    border_width = 0.001,
+    cluster_rows = F,
+    annotation_colors = ann_colors,
+    annotation_row = annotation_row
+  ) -> daa_hm
+
+pdf(
+  here(
+    "results",
+    "analysis_d32",
+    "abundance_daa_heatmap_meanclr_tcells_CD4Tmarkers.pdf"
+  ),
+  width = 10,
+  height = 3
+)
+daa_hm
+dev.off()
+```
+
+```{r fig.width=10, fig.height=3}
+lim_break <- 1
+daa_res_sign %>%
+  filter(marker %in% colnames(pdat)) |>
+  # mutate(difference = ifelse(p_adj>0.01, 0, difference)) |>
+  select(difference, cell_contrast, marker) %>%
+  tidyr::unite("population", cell_contrast, sep = " ") |>
+  pivot_wider(names_from = "population", values_from = "difference") %>%
+  column_to_rownames("marker") %>%
+  replace(is.na(.), 0) %>%
+  clipr::write_clip(allow_non_interactive = TRUE) |>
+  t() |>
+  pheatmap::pheatmap(
+    cellwidth = 14,
+    cellheight = 14,
+    fontsize = 12,
+    cluster_rows = F,
+    treeheight_col = 10,
+    breaks = seq(-lim_break, lim_break, 0.1),
+    color = differential_pal(length(seq(-lim_break, lim_break, 0.1))),
+    border_color = "white",
+    border_width = 0.001,
+    width = 12
+  ) -> daa_hm
+daa_hm
+
+pdf(
+  here(
+    "results",
+    "analysis_d32",
+    "abundance_daa_heatmap_meandiff_tcells_CD4Tmarkers.pdf"
+  ),
+  width = 10,
+  height = 3
+)
+daa_hm
+dev.off()
+```
+
+
+\
+
+CD8 T cells:
+
+```{r}
+cd8_markers <- list(
+  t2_vs_v1 = dap_list[["CD8 T_t2_vs_t1"]],
+  t3_vs_v1 = dap_list[["CD8 T_t3_vs_t1"]]
+)
+```
+
+```{r fig.width=10, fig.height=3}
+markers_select <- cd8_markers |> unlist() |> unique()
+
+pdat <- FetchData(
+  dat_test,
+  vars = c("sample_cell", markers_select),
+  layer = "data"
+) %>%
+  group_by(sample_cell) %>%
+  summarise_all(mean) %>%
+  column_to_rownames("sample_cell")
+
+# Filter plot data to only contain CD4 T cells and markers where mean CLR abundance > 0
+pdat <- pdat[grep("CD8", rownames(pdat), value = T), ]
+
+# cols_select_mean <- grep("FMC63", rownames(pdat), value = T)
+cols_select_mean_t1 <- grep("_t1", rownames(pdat), value = T)
+cols_select_mean_t2 <- grep("_t2", rownames(pdat), value = T)
+cols_select_mean_t3 <- grep("_t3", rownames(pdat), value = T)
+
+marker_means <- c(
+  colMeans(pdat[cols_select_mean_t1, ]),
+  colMeans(pdat[cols_select_mean_t2, ]),
+  colMeans(pdat[cols_select_mean_t3, ])
+)
+pdat <- pdat[, marker_means[marker_means > 0] |> names() |> unique()]
+
+row_order <- annotation_row[rownames(pdat), ] |>
+  arrange(celltype, timepoint) |>
+  rownames()
+
+# Plot
+pdat[row_order, ] |>
+  pheatmap::pheatmap(
+    cellwidth = 14,
+    cellheight = 14,
+    fontsize = 12,
+    treeheight_col = 10,
+    treeheight_row = 10,
+    border_color = "white",
+    border_width = 0.001,
+    cluster_rows = F,
+    annotation_colors = ann_colors,
+    annotation_row = annotation_row
+  ) -> daa_hm
+
+pdf(
+  here(
+    "results",
+    "analysis_d32",
+    "abundance_daa_heatmap_meanclr_tcells_CD8Tmarkers.pdf"
+  ),
+  width = 10,
+  height = 3
+)
+daa_hm
+dev.off()
+```
+
+```{r fig.width=10, fig.height=3}
+lim_break <- 1
+daa_res_sign %>%
+  filter(marker %in% colnames(pdat)) |>
+  # mutate(difference = ifelse(p_adj>0.01, 0, difference)) |>
+  select(difference, cell_contrast, marker) %>%
+  tidyr::unite("population", cell_contrast, sep = " ") |>
+  pivot_wider(names_from = "population", values_from = "difference") %>%
+  column_to_rownames("marker") %>%
+  replace(is.na(.), 0) %>%
+  clipr::write_clip(allow_non_interactive = TRUE) |>
+  t() |>
+  pheatmap::pheatmap(
+    cellwidth = 14,
+    cellheight = 14,
+    fontsize = 12,
+    cluster_rows = F,
+    treeheight_col = 10,
+    breaks = seq(-lim_break, lim_break, 0.1),
+    color = differential_pal(length(seq(-lim_break, lim_break, 0.1))),
+    border_color = "white",
+    border_width = 0.001,
+    width = 12
+  ) -> daa_hm
+daa_hm
+
+pdf(
+  here(
+    "results",
+    "analysis_d32",
+    "abundance_daa_heatmap_meandiff_tcells_CD8Tmarkers.pdf"
+  ),
+  width = 10,
+  height = 3
+)
+daa_hm
+dev.off()
+```
+
+
+
+
+\
+
+## Spatial: Colocalization
+
+### Prepare data
+
+Start by fetching the colocalization score data and filter it to exclude low abundance markers.
+
+```{r}
+#' Fetch data
+data_d32_prox <- data_d32
+data_d32_prox$component <- NULL
+
+colocscores_dat <- ColocalizationScores(
+  data_d32_prox,
+  meta_data_columns = c(
+    "sample",
+    "donor",
+    "FMC63_status_clr",
+    "celltype_broad",
+    "celltype",
+    "timepoint"
+  )
+)
+
+colocscores_dat$celltype_timepoint <- paste0(
+  colocscores_dat$celltype_broad,
+  "_",
+  colocscores_dat$timepoint
+)
+```
+
+```{r}
+#' Fetch marker count data
+cts <- data_d32_prox %>%
+  JoinLayers() %>%
+  LayerData(layer = "counts") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("marker") %>%
+  tidyr::pivot_longer(-marker, names_to = "component", values_to = "counts")
+
+# Add counts info to the colocalization scores
+colocscores_dat_filt <- colocscores_dat %>%
+  left_join(cts, by = c("marker_1" = "marker", "component")) %>%
+  rename(marker_1_count = counts) %>%
+  left_join(cts, by = c("marker_2" = "marker", "component")) %>%
+  rename(marker_2_count = counts) %>%
+  rowwise() %>%
+  mutate(lower_marker_count = min(marker_1_count, marker_2_count))
+```
+
+```{r}
+#' Filter to only retain marker pairs where the lowest abundant marker has an abundance
+#' higher than 20 or the maximum isotype control abundance (whichever is higher)
+count_cutoff <- 50
+colocscores_dat_filt <- colocscores_dat_filt %>%
+  rowwise() %>%
+  filter(lower_marker_count > count_cutoff)
+```
+
+```{r fig.width=6, fig.height=4}
+#' View the filtered colocalization score data
+colocscores_dat_filt %>%
+  group_by(marker_1, marker_2) %>%
+  summarise(n = n(), median = median(pearson_z)) %>%
+  ggplot(aes(x = n, y = median)) +
+  geom_point() +
+  geom_vline(xintercept = c(50, 100), linetype = "dashed", color = "orange") +
+  xlab("count_of_expressing_cells") +
+  ylab("pearson_z_median") +
+  ggtitle("Colocalization Scores") +
+  theme_bw()
+```
+
+```{r}
+#' Filter data to exclude markers with very low component detection rate in samples.
+#' We can set this to 50, which will exclude the marker pairs with the dominating variability in colocalization scores
+n_cell_cutoff <- 50
+colocscores_dat_filt <- colocscores_dat_filt %>%
+  group_by(marker_1, marker_2, sample) %>%
+  filter(n() >= n_cell_cutoff)
+```
+
+```{r fig.width=6, fig.height=4}
+#' View the filtered colocalization score data
+colocscores_dat_filt %>%
+  group_by(marker_1, marker_2) %>%
+  summarise(n = n(), median = median(pearson_z)) %>%
+  ggplot(aes(x = n, y = median)) +
+  geom_point() +
+  geom_vline(xintercept = c(50), linetype = "dashed", color = "orange") +
+  xlab("count_of_expressing_cells") +
+  ylab("pearson_z_median") +
+  ggtitle("Colocalization Scores - Filtered data") +
+  theme_bw()
+```
+
+\
+
+### Visualize raw scores
+
+Look at the overall colocalization patterns we have in the samples and cell types of interest.
+
+```{r}
+#' Prepare colocalization score data for running `SummarizeProximityScores()`
+colocscores_dat_filt_test <- colocscores_dat_filt
+colocscores_dat_filt_test$join_count_z <- colocscores_dat_filt_test$pearson_z
+```
+
+To begin, we summarize the colocalization scores for every sample and cell type, which will allow us to study the colocalization patterns across donors and timepoints.
+
+```{r}
+colocscores_summarized <- SummarizeProximityScores(
+  colocscores_dat_filt_test,
+  group_vars = c("sample", "celltype"),
+  proximity_metric = "join_count_z",
+  summary_stat = "mean",
+  include_missing_obs = T
+)
+
+colocscores_summarized <- colocscores_summarized |>
+  rename(celltype = celltype) |>
+  merge(mdat_df, by = "sample") |>
+  as_tibble()
+```
+
+```{r fig.width=20, fig.height=20}
+#| code-fold: true
+#' Generate raw summarized colocalization score heatmaps for all samples and cell types
+samples_plot <- colocscores_summarized$sample |> unique()
+celltypes_plot <- colocscores_summarized$celltype |> unique()
+celltypes_plot <- grep("CD", celltypes_plot, value = T) |> sort()
+
+p_list_cells <- lapply(celltypes_plot, function(ct) {
+  p_samples <- lapply(samples_plot, function(sample_select) {
+    donor <- mdat_df |> filter(sample == sample_select) |> pull(donor)
+    tp <- mdat_df |> filter(sample == sample_select) |> pull(timepoint)
+    hm_title <- paste0(ct, " (", donor, ", ", tp, ")")
+    p <- ColocalizationHeatmap(
+      colocscores_summarized |> filter(celltype == ct, sample == sample_select),
+      value_col = "mean_join_count_z",
+      # size_col = "pct_detected",
+      type = "tile",
+      legend_title = "Mean\npearson Z",
+      legend_range = c(-10, 10),
+      treeheight_row = 20,
+      treeheight_col = 20,
+      main = hm_title
+    )
+    return(p |> ggplotify::as.ggplot())
+  })
+  p_grid <- wrap_plots(p_samples, ncol = 2)
+  return(p_grid)
+})
+names(p_list_cells) <- celltypes_plot
+
+# for(p in p_list_cells){print(p)}
+
+pdf(
+  here(
+    "results",
+    "analysis_d32",
+    "colocalization_raw_summarized_scores_per_sample_tcell_equal.pdf"
+  ),
+  width = 20,
+  height = 20
+)
+for (p in p_list_cells) {
+  print(p)
+}
+dev.off()
+```
+
+```{r fig.width=20, fig.height=20}
+#| results: asis
+#| message: false
+tabset_df <- tibble(
+  name = names(p_list_cells),
+  fig = p_list_cells
+)
+
+tabset_df |>
+  quartabs::render_tabset(name, fig)
+```
+
+\
+
+Let's do the same visualizations, but put to the same color scale and in the same marker order, for easier comparison.
+
+```{r fig.width=17, fig.height=13}
+#| code-fold: true
+#' Generate raw summarized colocalization score heatmaps for all samples and cell types
+samples_plot <- colocscores_summarized$sample |> unique()
+celltypes_plot <- colocscores_summarized$celltype |> unique()
+celltypes_plot <- grep("CD", celltypes_plot, value = T) |> sort()
+
+p_list_cells <- lapply(celltypes_plot, function(ct) {
+  markers_shared <- colocscores_summarized |>
+    filter(celltype == ct) |>
+    mutate(marker_pair = paste0(marker_1, ":", marker_2)) |>
+    group_by(sample) |>
+    select(sample, marker_pair) |>
+    group_map(~ .x$marker_pair) |>
+    setNames(nm = samples_plot)
+  markers_shared <- Reduce(intersect, markers_shared) |>
+    strsplit(":") |>
+    unlist() |>
+    unique()
+  markers_shared <- c(markers_shared, "FMC63")
+
+  p_samples <- list()
+  for (i in c(2, 1, 3:4)) {
+    # 1:length(samples_plot) # Set order based on t1, not t0
+    sample_select <- samples_plot[i]
+    donor <- mdat_df |> filter(sample == sample_select) |> pull(donor)
+    tp <- mdat_df |> filter(sample == sample_select) |> pull(timepoint)
+    hm_title <- paste0("\n", ct, " (", donor, ", ", tp, ")")
+
+    if (i %in% c(2)) {
+      p <- ColocalizationHeatmap_custom(
+        colocscores_summarized |>
+          filter(marker_1 %in% markers_shared, marker_2 %in% markers_shared) |>
+          filter(celltype == ct, sample == sample_select) |>
+          mutate(size_same = ifelse(abs(mean_join_count_z) < 0.01, 0, 1)) |>
+          mutate(
+            size_diff_mean = ifelse(
+              abs(mean_join_count_z) < 0.01,
+              0,
+              abs(mean_join_count_z)
+            ),
+            size_constant = 1
+          ),
+        value_col = "mean_join_count_z",
+        size_col = "size_constant",
+        type = "dots",
+        legend_range = c(-5, 5),
+        size_range = c(1, 5),
+        legend_title = "Mean\npearson Z"
+      ) &
+        labs(title = hm_title, x = "", y = "")
+
+      p_build <- ggplot2::ggplot_build(p)
+      m_order <- p_build$layout$panel_params[[1]]$x$get_labels()
+    } else {
+      p <- ColocalizationHeatmap_custom(
+        colocscores_summarized |>
+          filter(celltype == ct, sample == sample_select) |>
+          filter(marker_1 %in% m_order, marker_2 %in% m_order) |>
+          mutate(size_same = ifelse(abs(mean_join_count_z) < 0.01, 0, 1)) |>
+          mutate(
+            size_diff_mean = ifelse(
+              abs(mean_join_count_z) < 0.01,
+              0,
+              abs(mean_join_count_z)
+            ),
+            size_constant = 1
+          ),
+        value_col = "mean_join_count_z",
+        size_col = "size_constant",
+        type = "dots",
+        legend_range = c(-5, 5),
+        size_range = c(2, 5),
+        marker_order = m_order,
+        cluster_rows = F,
+        cluster_cols = F,
+        legend_title = "Mean\npearson Z"
+      ) &
+        labs(title = hm_title, x = "", y = "")
+    }
+
+    # return(p |> ggplotify::as.ggplot())
+    p_samples[[i]] <- p
+  }
+  p_grid <- wrap_plots(p_samples, ncol = 2)
+  return(
+    p_grid &
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0)
+      )
+  )
+})
+names(p_list_cells) <- celltypes_plot
+
+pdf(
+  here(
+    "results",
+    "analysis_d32",
+    "colocalization_raw_summarized_scores_per_sample_tcell_dots_equal.pdf"
+  ),
+  width = 17,
+  height = 13
+)
+for (p in p_list_cells) {
+  print(p)
+}
+dev.off()
+```
+
+```{r fig.width=17, fig.height=13}
+#| results: asis
+#| message: false
+tabset_df <- tibble(
+  name = names(p_list_cells),
+  fig = p_list_cells
+)
+
+tabset_df |>
+  quartabs::render_tabset(name, fig)
+```
+
+
+## Selected visualizations
+
+### Beeswarm plots
+
+```{r fig.width=8, fig.height=6}
+#| code-fold: true
+#| message: false
+pal_donor_time <- setNames(
+  c("#C0B2E9", "#A38EDC", "#876BCD", "#A1DAD0", "#3FAC9B", "#0D6D5E"),
+  nm = mdat_df |> arrange(timepoint, donor) |> pull(sample)
+)
+
+celltypes_plot <- grep("CD", colocscores_dat$celltype |> unique(), value = T)
+
+marker_pair_plot_list <- c(
+  "FMC63:CD3E",
+  "FMC63:CD45",
+  "FMC63:CD8",
+  "CD44:CD45",
+  "CD43:CD44",
+  "CD18:CD43",
+  "CD18:CD55",
+  "CD8:CD82",
+  "CD45:CD82"
+)
+
+# marker_pair_plot <- marker_pair_plot_list[1]
+p_list <- lapply(marker_pair_plot_list, function(marker_pair_plot) {
+  message(marker_pair_plot)
+  colocscores_plot <- colocscores_dat |>
+    mutate(
+      marker_pair = ifelse(
+        marker_2 == "FMC63",
+        paste0(marker_2, ":", marker_1),
+        paste0(marker_1, ":", marker_2)
+      )
+    ) |>
+    filter(celltype %in% celltypes_plot) |>
+    filter(marker_pair %in% marker_pair_plot) |>
+    # merge(mdat_df |> select(sample, donor), by = "sample") |>
+    select(
+      marker_pair,
+      pearson_z,
+      pearson_p_value_adjusted,
+      timepoint,
+      sample,
+      donor,
+      celltype,
+      component
+    )
+
+  p1 <- ggplot(colocscores_plot, aes(x = timepoint, y = pearson_z)) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.25) +
+    geom_quasirandom(
+      mapping = aes(color = timepoint, fill = timepoint),
+      dodge.width = 0.8,
+      size = .1,
+      width = 0.12
+    ) +
+    stat_summary(
+      aes(group = sample),
+      fun = mean,
+      fun.min = mean,
+      fun.max = mean,
+      geom = "crossbar",
+      color = "black",
+      width = 0.4,
+      lwd = 0.25,
+      position = position_dodge(width = 0.8)
+    ) +
+    facet_grid(~celltype) +
+    scale_fill_manual(values = pal_time) +
+    scale_color_manual(values = pal_time) +
+    labs(
+      y = "Colocalization score\n(Pearson Z)",
+      x = "",
+      title = marker_pair_plot,
+      caption = "bar: median value"
+    ) +
+    theme_linedraw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = NA, color = NA),
+      strip.text = element_text(color = "black", size = 10),
+      axis.text = element_text(color = "black", size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title.x = element_blank(),
+      text = element_text(color = "black", size = 10),
+      plot.title = element_text(
+        color = "black",
+        size = 10,
+        hjust = 0.5,
+        face = "bold"
+      )
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 3)))
+
+  p <- p1
+
+  return(p)
+})
+names(p_list) <- marker_pair_plot_list
+
+pdf(
+  here("results", "analysis_d32", "colocalization_raw_selected_beeswarm.pdf"),
+  width = 8,
+  height = 3
+)
+for (p in p_list) {
+  print(p)
+}
+dev.off()
+```
+
+```{r fig.width=8, fig.height=3}
+#| results: asis
+tabset_df <- tibble(
+  name = names(p_list),
+  fig = p_list
+)
+
+tabset_df |>
+  quartabs::render_tabset(name, fig)
+```
+
+\
+
+# Conclusion
+
+## Export data
+
+```{r}
+#| eval: false
+#' Save entire workspace (for reproducibility in case something needs to be replotted)
+# save.image(here("rdata", "workspace_suzuki_cart_script02_d32_2025-10-01.RData"))
+# load(here("rdata", "workspace_suzuki_cart_script02_d32_2025-10-01.RData"))
+```
+
+
+## Session information
+
+```{r}
+sessionInfo()
+```
+
+

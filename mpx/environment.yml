@@ -1,0 +1,46 @@
+name: suzuki_mpx_cart
+channels:
+  - conda-forge
+  - bioconda
+  - r
+  - defaults
+dependencies:
+  - r-base
+  - r-remotes
+  - r-arrow
+  - r-cli
+  - r-ggplot2
+  - r-tidyverse
+  - r-ggraph
+  - r-glue
+  - r-graphlayouts
+  - r-igraph
+  - r-jsonlite
+  - r-rlang
+  - r-scales
+  - r-stringr
+  - r-testthat
+  - r-tibble
+  - r-tidygraph
+  - r-tidyr
+  - r-dplyr
+  - r-seurat >= 5.0.0
+  - r-seuratobject >= 5.0.0
+  - r-mclust
+  - bioconductor-limma
+  - r-matrix
+  - r-patchwork
+  - r-pheatmap
+  - r-hdf5r
+  - r-pbapply
+  - r-dbplyr
+  - r-fs
+  - r-zip
+  - r-plotly
+  - r-lifecycle
+  - r-devtools
+  - r-styler
+  - r-lintr
+  - r-spelling
+  - r-graphlayouts
+  - r-mass
