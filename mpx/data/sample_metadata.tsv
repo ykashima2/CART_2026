@@ -1,9 +1,0 @@
-sample	donor	type	dpi	timepoint
-TKB_CAR-T_64	donor_32	CAR-T_product	d00	t0
-TKB_CAR-T_73	donor_32	PBMC	d08	t1
-TKB_CAR-T_79	donor_32	PBMC	d13	t2
-TKB_CAR-T_84	donor_32	PBMC	d24	t3
-TKB_CAR_T_95	donor_44	CAR-T_product	d00	t0
-TKB_CAR_T_97	donor_44	PBMC	d08	t1
-TKB_CAR_T_105	donor_50	CAR-T_product	d00	t0
-TKB_CAR_T_112	donor_50	PBMC	d09	t1
